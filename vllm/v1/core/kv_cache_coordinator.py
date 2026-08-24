@@ -724,8 +724,30 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             return num_tokens
         return round_down(num_tokens, self.scheduler_block_size)
 
+    def _retention_replay_boundary(self, request: Request) -> int:
+        """Replay boundary for sparse retention. Hybrid hits are bounded by
+        the Dense reference group (#46453); under EAGLE its lookup drops one
+        unit, so keep the boundary one unit lower (issue #53504). Hybrids
+        with no full-attention reference stay unshifted (SWA shifts itself).
+        """
+        boundary = request.num_prompt_tokens - 1
+        if self.full_attention_group_id is not None:
+            fa = self.single_type_managers[self.full_attention_group_id]
+            if fa.use_eagle:
+                unit = fa.block_size
+                if (
+                    self.enable_partial_hash_hits
+                    and fa.supports_fine_grained_hash_lookup
+                    and fa.block_size > self.hash_block_size
+                ):
+                    unit = self.hash_block_size
+                aligned = boundary - boundary % unit
+                boundary = max(aligned - unit, 0)
+        return boundary
+
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         cached_num_computed_tokens = self._align_cacheable(num_computed_tokens)
+        replay_boundary = self._retention_replay_boundary(request)
         for manager in self.single_type_managers:
             num_tokens_to_cache = cached_num_computed_tokens
             # EAGLE groups match one block past each aligned boundary and drop
@@ -752,6 +774,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 request,
                 num_tokens_to_cache,
                 retention_interval=self.retention_interval,
+                replay_boundary=replay_boundary,
             )
 
     def find_longest_cache_hit(

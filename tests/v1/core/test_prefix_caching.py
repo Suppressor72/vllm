@@ -4192,6 +4192,189 @@ def test_mamba_shared_prefix_survives_zero_retention():
     assert cached_mamba_blocks(96) == {5, 14}
 
 
+def test_mamba_eagle_backoff_retains_and_repeats_at_adjusted_boundary():
+    """Regression for #53504: with EAGLE, sparse retention must keep the
+    boundary one block lower, and the first identical repeat must hit there
+    instead of missing entirely."""
+    block_size = 16
+
+    def setup(use_eagle):
+        manager = make_kv_cache_manager(
+            _make_hybrid_kv_cache_config(block_size, 100, ["full", "mamba"]),
+            max_model_len=8192,
+            enable_caching=True,
+            hash_block_size=block_size,
+            retention_interval=0,
+            use_eagle=use_eagle,
+        )
+        token_ids = [i for i in range(7) for _ in range(block_size)] + [7] * 7
+        req = make_request("r", token_ids, block_size, sha256)
+        cb, nc, _ = manager.get_computed_blocks(req)
+        assert manager.allocate_slots(req, len(token_ids), nc, cb) is not None
+        return manager, req, token_ids
+
+    # Without EAGLE the replay boundary stays unshifted (block 6).
+    manager, req, _ = setup(False)
+    cached = {
+        i
+        for i in range(7)
+        if manager.block_pool.get_cached_block(
+            req.block_hashes[i], kv_cache_group_ids=[1]
+        )
+        is not None
+    }
+    assert cached == {6}
+    manager.free(req)
+
+    # With EAGLE the boundary backs off one block (block 5) ...
+    manager, req, token_ids = setup(True)
+    cached = {
+        i
+        for i in range(7)
+        if manager.block_pool.get_cached_block(
+            req.block_hashes[i], kv_cache_group_ids=[1]
+        )
+        is not None
+    }
+    assert cached == {5}
+    manager.free(req)
+
+    # ... so the first identical repeat hits at 96 tokens, not zero.
+    req1 = make_request("1", token_ids, block_size, sha256)
+    cb1, nc1, _ = manager.get_computed_blocks(req1)
+    assert nc1 == 6 * block_size, f"expected 96, got {nc1}"
+    manager.free(req1)
+
+
+def test_mamba_eagle_backoff_not_applied_without_full_attention_peer():
+    """The backoff compensates a peer group's drop (#46453): unitary Mamba
+    must stay unshifted even with the eagle flag propagated to it."""
+    block_size = 16
+    manager = make_kv_cache_manager(
+        _make_hybrid_kv_cache_config(block_size, 100, ["mamba"]),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        retention_interval=0,
+        use_eagle=True,
+    )
+    token_ids = [i for i in range(7) for _ in range(block_size)] + [7] * 7
+    req = make_request("r", token_ids, block_size, sha256)
+    cb, nc, _ = manager.get_computed_blocks(req)
+    assert manager.allocate_slots(req, len(token_ids), nc, cb) is not None
+    pool = manager.block_pool
+    cached = {
+        i
+        for i in range(7)
+        if pool.get_cached_block(req.block_hashes[i], kv_cache_group_ids=[0])
+        is not None
+    }
+    # Unshifted replay boundary (block 6) — no peer drop to compensate.
+    assert cached == {6}
+    manager.free(req)
+
+
+@pytest.mark.parametrize(
+    "num_extra,expected_hit",
+    [(15, 5 * 16), (16, 5 * 16), (17, 6 * 16)],
+)
+def test_mamba_eagle_replay_boundary_around_block_edges(num_extra, expected_hit):
+    """#53504 edge lengths: prompts ending at nB-1/nB/nB+1 all hit at the
+    boundary derived from the unshifted ``num_prompt_tokens - 1`` base."""
+    block_size = 16
+    manager = make_kv_cache_manager(
+        _make_hybrid_kv_cache_config(block_size, 100, ["full", "mamba"]),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        retention_interval=0,
+        use_eagle=True,
+    )
+    token_ids = [i for i in range(6) for _ in range(block_size)] + [6] * num_extra
+
+    req0 = make_request("0", token_ids, block_size, sha256)
+    cb, nc, _ = manager.get_computed_blocks(req0)
+    assert nc == 0
+    assert manager.allocate_slots(req0, len(token_ids), nc, cb) is not None
+    manager.free(req0)
+
+    req1 = make_request("1", token_ids, block_size, sha256)
+    cb1, nc1, _ = manager.get_computed_blocks(req1)
+    assert nc1 == expected_hit, (
+        f"num_extra={num_extra}: expected {expected_hit}, got {nc1}"
+    )
+    manager.free(req1)
+
+
+def test_mamba_eagle_backoff_uses_reference_group_unit_mixed_geometry():
+    """Unequal geometry: the backoff unit is the reference group's (32),
+    not Mamba's (16) — the reconcilable boundary is bounded by the peer."""
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheGroupSpec,
+        KVCacheConfig,
+    )
+    from vllm.v1.core.single_type_kv_cache_manager import MambaSpec
+
+    full_bs, mamba_bs = 32, 16
+    kv_cache_config = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer"],
+                FullAttentionSpec(
+                    block_size=full_bs, num_kv_heads=1, head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["layer"],
+                MambaSpec(
+                    block_size=mamba_bs,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=mamba_bs,
+        retention_interval=0,
+        use_eagle=True,
+    )
+    # 7 full-attention blocks (224 tokens) + 31 partial = 255 tokens.
+    token_ids = [i for i in range(7) for _ in range(full_bs)] + [7] * 31
+
+    req0 = make_request("0", token_ids, mamba_bs, sha256)
+    cb, nc, _ = manager.get_computed_blocks(req0)
+    assert nc == 0
+    assert manager.allocate_slots(req0, len(token_ids), nc, cb) is not None
+    manager.free(req0)
+
+    # Reference unit 32: boundary 254 -> aligned 224 -> back off 32 -> 192.
+    # The Mamba mask must retain the state at 192 (block 11 of 16 tokens).
+    pool = manager.block_pool
+    mamba_group_id = 1
+    cached = {
+        i
+        for i in range(len(req0.block_hashes))
+        if pool.get_cached_block(
+            req0.block_hashes[i], kv_cache_group_ids=[mamba_group_id]
+        ) is not None
+    }
+    assert 192 // mamba_bs - 1 in cached, (
+        f"expected the 192-token boundary state retained, cached={cached}"
+    )
+    req1 = make_request("1", token_ids, mamba_bs, sha256)
+    cb1, nc1, _ = manager.get_computed_blocks(req1)
+    assert nc1 == 192, f"expected repeat hit at 192, got {nc1}"
+    manager.free(req1)
+
+
 def test_mamba_shared_prefix_reuse_under_zero_retention():
     """Full cross-request Marconi flow: a partial shared prefix cached by the
     detecting request must stay reusable by a later request under
