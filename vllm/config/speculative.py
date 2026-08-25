@@ -474,9 +474,12 @@ class SpeculativeConfig:
 
     skip_draft_when_k0: bool = False
     """Opt-in: on engine steps whose dynamically resolved
-    ``num_speculative_tokens`` is 0, skip the draft-model forward entirely
-    (the ``DSD K=0`` prefill normally kept to sync draft KV state for a
-    possible later K>0 resume).
+    ``num_speculative_tokens`` is 0, run the step draft-free: skip the
+    draft-model forward entirely (the ``DSD K=0`` prefill normally kept to
+    sync draft KV state for a possible later K>0 resume) and skip
+    draft-protective prefix-cache work (the EAGLE last-block drop at
+    admission, whose projected K resolves to 0 — the drop only protects
+    consumers that draft from the hit boundary).
 
     Measured (see the linked issue): the sync forward costs 4-11% decode
     time on K=0-resolving batch sizes. Skipping it is safe only for
