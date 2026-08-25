@@ -229,7 +229,9 @@ class KVCacheManager:
             preempted=request.num_preemptions > 0,
         )
 
-    def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int, int]:
+    def get_computed_blocks(
+        self, request: Request, drop_eagle: bool = True
+    ) -> tuple[KVCacheBlocks, int, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
 
@@ -262,7 +264,7 @@ class KVCacheManager:
         max_cache_hit_length = request.num_tokens - 1
         computed_blocks, num_new_computed_tokens, num_uncached = (
             self.coordinator.find_longest_cache_hit(
-                request.block_hashes, max_cache_hit_length
+                request.block_hashes, max_cache_hit_length, drop_eagle=drop_eagle
             )
         )
 

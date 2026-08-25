@@ -271,6 +271,7 @@ class Scheduler(SchedulerInterface):
                     vllm_num_speculative_tokens=self.num_spec_tokens,
                 )
             self.use_eagle = speculative_config.use_eagle()
+            self.skip_draft_when_k0 = bool(speculative_config.skip_draft_when_k0)
             if self.use_eagle:
                 self.num_prefill_lookahead = (
                     self.num_spec_tokens
@@ -463,6 +464,26 @@ class Scheduler(SchedulerInterface):
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
 
+    def _admission_eagle_drop(self) -> bool:
+        """Whether the EAGLE prefix-cache last-block drop applies at admission.
+
+        The drop only protects consumers that may draft (K > 0): draft-layer
+        KV for the last matched block depends on the writer's continuation,
+        and prefill-lookahead writes only happen with drafting active. Under
+        ``skip_draft_when_k0``, a resolved K=0 consumer never reads
+        draft-layer KV, so the drop is unnecessary there. Projected batch
+        size = running + this admission; a mis-projection can only make the
+        hit shorter (safe) or serve a hit whose draft tail is stale, which
+        rejection sampling keeps lossless (target KV verifies every token).
+        """
+        if not (self.use_eagle and self.skip_draft_when_k0):
+            return True
+        if self.dynamic_sd_lookup is None:
+            return True
+        projected = len(self.running) + 1
+        k = self.dynamic_sd_lookup[min(projected, len(self.dynamic_sd_lookup) - 1)]
+        return k > 0
+
     def _get_local_prefix_cache_hit(
         self, request: Request
     ) -> tuple[KVCacheBlocks, int, int, bool]:
@@ -471,7 +492,9 @@ class Scheduler(SchedulerInterface):
             return self.kv_cache_manager.get_computed_blocks_for_connector(request)
 
         blocks, num_local, shared_prefix_boundary = (
-            self.kv_cache_manager.get_computed_blocks(request)
+            self.kv_cache_manager.get_computed_blocks(
+                request, drop_eagle=self._admission_eagle_drop()
+            )
         )
         return blocks, num_local, shared_prefix_boundary, False
 
@@ -893,7 +916,9 @@ class Scheduler(SchedulerInterface):
                                 new_computed_blocks,
                                 num_new_local_computed_tokens,
                                 request.shared_prefix_boundary,
-                            ) = self.kv_cache_manager.get_computed_blocks(request)
+                            ) = self.kv_cache_manager.get_computed_blocks(
+                                request, drop_eagle=self._admission_eagle_drop()
+                            )
 
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
