@@ -237,6 +237,11 @@ class KVCacheManager:
 
         Args:
             request: The request to get the computed blocks.
+            drop_eagle: Whether EAGLE-marked groups apply their normal
+                last-hit-unit drop. Only the consumer of the hit knows
+                whether it will draft; a resolved-K=0 consumer under
+                ``skip_draft_when_k0`` never reads draft-layer KV and can
+                skip the drop.
 
         Returns:
             A tuple containing:
