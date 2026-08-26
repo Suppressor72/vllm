@@ -58,6 +58,84 @@ def test_resolve_adaptive_cudagraph_mode(mode, piecewise_capture_available, expe
 
 
 @pytest.mark.parametrize(
+    "target_bound",
+    [8, None],
+)
+def test_manager_scopes_varlen_check_without_weakening_runner_cg_mode(
+    monkeypatch, target_bound
+):
+    class Backend:
+        @classmethod
+        def supports_device_cpu_query_lens_mismatch(cls):
+            return True
+
+    def make_builder(support, bound=None):
+        class Builder(AttentionMetadataBuilder):
+            _cudagraph_support = support
+
+            def __init__(self):
+                pass
+
+            def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+                raise NotImplementedError
+
+            if bound is not None:
+
+                @classmethod
+                def get_varlen_cudagraph_max_query_len(cls, *_args):
+                    return bound
+
+        return Builder()
+
+    target_builder = make_builder(
+        AttentionCGSupport.ALWAYS
+        if target_bound is None
+        else AttentionCGSupport.UNIFORM_BATCH,
+        target_bound,
+    )
+    draft_builder = make_builder(AttentionCGSupport.UNIFORM_BATCH)
+
+    def group(layer_name, builder):
+        return SimpleNamespace(
+            layer_names=[layer_name],
+            backend=Backend,
+            kv_cache_spec=None,
+            get_metadata_builder=lambda _index: builder,
+        )
+
+    groups = [
+        [
+            group("target", target_builder),
+            group("draft", draft_builder),
+        ]
+    ]
+    runner_support = AttentionCGSupportInfo(
+        AttentionCGSupport.UNIFORM_BATCH, "DraftBackend"
+    )
+    created = object()
+    monkeypatch.setattr(
+        adaptive_module,
+        "AdaptiveVerificationManager",
+        lambda *_args, **_kwargs: created,
+    )
+
+    manager = maybe_create_adaptive_verification_manager(
+        enable_adaptive_verification=True,
+        attn_groups=groups,
+        attn_cg_support=runner_support,
+        req_states=object(),
+        query_start_loc=object(),
+        num_bonus_tokens=1,
+        max_total_logits=1,
+        vllm_config=None,
+        target_layer_names={"target"},
+    )
+
+    assert manager is created
+    assert runner_support.min_cg_support == AttentionCGSupport.UNIFORM_BATCH
+
+
+@pytest.mark.parametrize(
     "target_support,target_bound,device_offsets,additional,error",
     [
         pytest.param(AttentionCGSupport.ALWAYS, None, True, None, None, id="always"),
@@ -161,6 +239,37 @@ def test_manager_checks_target_varlen_cudagraph_bound(
             additional_attn_cg_support=additional,
         )
         assert manager is created
+
+
+def test_manager_rejects_backend_without_varlen_decode_cudagraphs():
+    class Backend:
+        @classmethod
+        def supports_device_cpu_query_lens_mismatch(cls):
+            return True
+
+    builder = SimpleNamespace(
+        get_cudagraph_support=lambda *_args: AttentionCGSupport.UNIFORM_BATCH
+    )
+    group = SimpleNamespace(
+        layer_names=["target"],
+        backend=Backend,
+        kv_cache_spec=None,
+        get_metadata_builder=lambda _index: builder,
+    )
+    support = AttentionCGSupportInfo(AttentionCGSupport.UNIFORM_BATCH, "TargetBackend")
+
+    with pytest.raises(ValueError, match="VARLEN_DECODE or AttentionCGSupport.ALWAYS"):
+        maybe_create_adaptive_verification_manager(
+            enable_adaptive_verification=True,
+            attn_groups=[[group]],
+            attn_cg_support=support,
+            req_states=object(),
+            query_start_loc=object(),
+            num_bonus_tokens=1,
+            max_total_logits=1,
+            vllm_config=None,
+            target_layer_names={"target"},
+        )
 
 
 def test_budget_stops_where_marginal_drafts_stop_paying_for_themselves():

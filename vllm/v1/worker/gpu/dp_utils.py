@@ -175,7 +175,6 @@ def sync_cudagraph_and_dp_padding(
     synced_max_query_len: int | None = None
     if bool(torch.all(max_query_lens_across_dp != -1)):
         synced_max_query_len = int(max_query_lens_across_dp.max())
-
     # Dispatch for the final synced values, use num_reqs instead of synced_num_reqs
     # so we don't perform request padding for PIECEWISE graphs.
     # num_active_loras is per-rank and doesn't need cross-rank agreement.

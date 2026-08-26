@@ -1007,6 +1007,7 @@ def test_resolve_cudagraph_mode_adjusts_spec_decode_sizes_only_for_v1(
 
 
 @pytest.mark.parametrize(
+<<<<<<< HEAD
     ("mode", "piecewise_capture_available", "attention_support", "expected"),
     [
         ("PIECEWISE", False, "ALWAYS", "NONE"),
@@ -1066,6 +1067,41 @@ def test_late_piecewise_restrictions_without_compilation(monkeypatch, engine_kwa
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
     assert config.compilation_config.cudagraph_capture_sizes == []
     assert config.compilation_config.max_cudagraph_capture_size == 0
+=======
+    ("support", "piecewise_available", "expected_mode"),
+    [
+        (
+            AttentionCGSupport.VARLEN_DECODE,
+            False,
+            CUDAGraphMode.FULL_DECODE_ONLY,
+        ),
+        (
+            AttentionCGSupport.VARLEN_DECODE,
+            True,
+            CUDAGraphMode.FULL_AND_PIECEWISE,
+        ),
+        (AttentionCGSupport.ALWAYS, False, CUDAGraphMode.FULL),
+    ],
+)
+def test_varlen_decode_support_does_not_enable_mixed_full_graphs(
+    support, piecewise_available, expected_mode
+):
+    compilation_config = CompilationConfig(
+        cudagraph_mode=CUDAGraphMode.FULL,
+        mode=(CompilationMode.VLLM_COMPILE if piecewise_available else None),
+    )
+    if piecewise_available:
+        compilation_config.set_splitting_ops_for_v1("", 1)
+
+    resolved_mode = compilation_config.resolve_cudagraph_mode_and_sizes(
+        support,
+        "FakeAttentionBackend",
+        uniform_decode_query_len=8,
+        use_v2_model_runner=True,
+    )
+
+    assert resolved_mode == expected_mode
+>>>>>>> 558c3dd9f4 (enable varlen decode cuda graphs for gdn)
 
 
 def test_resolve_cudagraph_mode_skips_mamba_block_check_while_profiling():

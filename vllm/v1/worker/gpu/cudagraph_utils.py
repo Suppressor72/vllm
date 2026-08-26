@@ -314,6 +314,7 @@ class CudaGraphManager:
                     num_reqs=min(num_tokens, self.max_num_reqs),
                     max_query_len=self.decode_query_len,
                     num_active_loras=num_active_loras,
+                    decode_only=True,
                 )
                 descs_by_mode[decode_mode].append(desc)
             # Capture uniform decode specfifc graphs if required
@@ -336,6 +337,7 @@ class CudaGraphManager:
                         num_reqs=rounded_num_reqs,
                         uniform_token_count=decode_query_len,
                         num_active_loras=num_active_loras,
+                        decode_only=True,
                     )
 
                     # avoid duplicate graphs

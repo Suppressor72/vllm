@@ -25,9 +25,10 @@ from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     compute_causal_conv1d_metadata,
     mamba_get_block_table_tensor,
+    max_decode_query_len,
     split_decodes_and_prefills,
 )
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 # FlashInfer's GDN prefill emits states every N tokens, N a multiple of its
 # 64-token chunk, so checkpoint offsets must be multiples of 64.
@@ -84,6 +85,13 @@ class GDNAttentionBackend(AttentionBackend):
     def is_ssm(cls) -> bool:
         return True
 
+    @classmethod
+    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+        # GDN state planning and decode kernels use the device-side
+        # query_start_loc. CPU query lengths are only used for batch
+        # classification and fixed-size bookkeeping.
+        return True
+
 
 @dataclass
 class GDNAttentionMetadata:
@@ -134,6 +142,14 @@ class GDNAttentionMetadata:
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
     kv_cache_spec: MambaSpec
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+
+    @classmethod
+    def get_varlen_cudagraph_max_query_len(
+        cls, vllm_config: VllmConfig, kv_cache_spec: KVCacheSpec
+    ) -> int | None:
+        # GDN decode kernels use the device-side query_start_loc, so varlen
+        # decode cudagraphs can replay up to the decode query bound.
+        return max_decode_query_len(vllm_config)
 
     reorder_batch_threshold: int = 1
 
