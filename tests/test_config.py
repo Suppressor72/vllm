@@ -347,6 +347,37 @@ def test_resolve_cudagraph_mode_adjusts_spec_decode_sizes_only_for_v1(
     assert compilation_config.cudagraph_capture_sizes == expected_capture_sizes
 
 
+def test_varlen_decode_support_orders_between_uniform_batch_and_always():
+    """VARLEN_DECODE must remain above UNIFORM_BATCH and below ALWAYS so
+    every value-ordering consumer (resolver gates, min-support selection)
+    keeps working."""
+    assert (
+        AttentionCGSupport.UNIFORM_BATCH.value
+        < AttentionCGSupport.VARLEN_DECODE.value
+        < AttentionCGSupport.ALWAYS.value
+    )
+
+
+def test_resolve_cudagraph_mode_downgrades_mixed_full_for_varlen_decode():
+    """VARLEN_DECODE claims ragged decode FULL capture only: a requested
+    mixed-prefill-decode FULL mode downgrades exactly as UNIFORM_BATCH
+    does, while spec-decode decode FULL (uniform_decode_query_len > 1)
+    still passes."""
+    compilation_config = CompilationConfig(cudagraph_mode=CUDAGraphMode.FULL)
+    cudagraph_mode = compilation_config.resolve_cudagraph_mode_and_sizes(
+        AttentionCGSupport.VARLEN_DECODE,
+        "GDN_ATTN",
+        uniform_decode_query_len=4,
+        use_v2_model_runner=True,
+        tensor_parallel_size=1,
+    )
+
+    # Mixed prefill-decode full capture is reserved for ALWAYS.
+    assert cudagraph_mode.mixed_mode() != CUDAGraphMode.FULL
+    # Spec-decode decode FULL requires >= UNIFORM_BATCH: VARLEN_DECODE keeps it.
+    assert cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+
+
 def test_resolve_cudagraph_mode_skips_mamba_block_check_while_profiling():
     """Cudagraph memory profiling uses a minimal KV cache, so the Mamba
     block-count guard must only fire for the real cache sizing."""

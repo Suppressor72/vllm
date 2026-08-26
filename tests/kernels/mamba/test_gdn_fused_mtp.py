@@ -236,18 +236,27 @@ def test_fused_forward_uses_packed_entrypoint() -> None:
 
 
 @pytest.mark.parametrize(
-    "seq_lens,query_lens,draft_tokens,expected_fused_calls",
+    "seq_lens,query_lens,draft_tokens,expected_fused_calls,num_accepted",
     [
-        pytest.param([128], [SPEC_TOKENS], [NUM_SPEC], 1, id="pure-mtp"),
+        pytest.param([128], [SPEC_TOKENS], [NUM_SPEC], 1, None, id="pure-mtp"),
         pytest.param(
             [128, 96],
             [SPEC_TOKENS, 64],
             [NUM_SPEC, -1],
             0,
+            None,
             id="mixed-mtp-falls-back",
         ),
-        pytest.param([96], [64], [-1], 0, id="pure-prefill"),
-        pytest.param([128], [1], [-1], 0, id="pure-decode"),
+        pytest.param([96], [64], [-1], 0, None, id="pure-prefill"),
+        pytest.param([128], [1], [-1], 0, None, id="pure-decode"),
+        # Partial rejection (2 of 3 drafts accepted) and full acceptance
+        # exercise the accept/reject rollback row of both the conv and the
+        # recurrent state; the cases above only cover accepted == 1
+        # (full draft rejection).
+        pytest.param([128], [SPEC_TOKENS], [NUM_SPEC], 1, [2], id="partial-reject"),
+        pytest.param(
+            [128], [SPEC_TOKENS], [NUM_SPEC], 1, [SPEC_TOKENS], id="full-accept"
+        ),
     ],
 )
 @torch.inference_mode()
@@ -256,6 +265,7 @@ def test_fused_model_path_matches_reference(
     query_lens: list[int],
     draft_tokens: list[int],
     expected_fused_calls: int,
+    num_accepted: list[int] | None,
 ) -> None:
     """Fused MTP and its mixed/prefill/decode fallbacks match the reference."""
     torch.manual_seed(1)
@@ -281,8 +291,10 @@ def test_fused_model_path_matches_reference(
         metadata = builder.build(
             common_prefix_len=0,
             common_attn_metadata=common,
-            num_accepted_tokens=torch.ones(
-                batch.batch_size, dtype=torch.int32, device=device
+            num_accepted_tokens=(
+                torch.ones(batch.batch_size, dtype=torch.int32, device=device)
+                if num_accepted is None
+                else torch.tensor(num_accepted, dtype=torch.int32, device=device)
             ),
             num_decode_draft_tokens_cpu=torch.tensor(draft_tokens, dtype=torch.int32),
         )

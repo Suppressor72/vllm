@@ -459,10 +459,14 @@ def maybe_create_adaptive_verification_manager(
             "use a backend that does."
         )
 
-    if attn_cg_support.min_cg_support != AttentionCGSupport.ALWAYS:
+    if attn_cg_support.min_cg_support not in (
+        AttentionCGSupport.VARLEN_DECODE,
+        AttentionCGSupport.ALWAYS,
+    ):
         raise ValueError(
             "Adaptive verification captures varlen decode cudagraphs, so every"
-            " attention builder must report AttentionCGSupport.ALWAYS, but "
+            " attention builder must report AttentionCGSupport.VARLEN_DECODE"
+            " (decode-only full capture) or AttentionCGSupport.ALWAYS, but "
             f"{attn_cg_support.min_cg_attn_backend} reports "
             f"{attn_cg_support.min_cg_support}. Pass "
             "enable_adaptive_verification=false in the speculative config, or "

@@ -150,7 +150,7 @@ The CUDA Graphs wrapper no longer manages the warm-up logic. The warm-up process
 
 ## CUDA Graphs Compatibility of Attention Backends
 
-To signal the CUDA Graphs compatibility of the attention backends, we introduce a new enum type [AttentionCGSupport][vllm.v1.attention.backend.AttentionCGSupport], which is an enum type that tracks the capability of the attention backend to support CUDA Graphs. The value is sorted in the order of the capability, i.e., `ALWAYS`> `UNIFORM_BATCH`> `UNIFORM_SINGLE_TOKEN_DECODE`> `NEVER`.
+To signal the CUDA Graphs compatibility of the attention backends, we introduce a new enum type [AttentionCGSupport][vllm.v1.attention.backend.AttentionCGSupport], which is an enum type that tracks the capability of the attention backend to support CUDA Graphs. The value is sorted in the order of the capability, i.e., `ALWAYS`> `VARLEN_DECODE`> `UNIFORM_BATCH`> `UNIFORM_SINGLE_TOKEN_DECODE`> `NEVER`.
 
 ```python
 class AttentionCGSupport(enum.Enum):
@@ -158,8 +158,13 @@ class AttentionCGSupport(enum.Enum):
     Here we do not consider the cascade attention, as currently
     it is never CUDA Graphs supported."""
 
-    ALWAYS = 3
+    ALWAYS = 4
     """CUDA Graphs always supported; supports mixed-prefill-decode"""
+    VARLEN_DECODE = 3
+    """CUDA Graphs supported for decode batches whose per-request query lengths
+    may differ (ragged/varlen decode), e.g. adaptive verification's trimmed
+    spec-decode windows. Mixed prefill-decode full capture still requires
+    ALWAYS."""
     UNIFORM_BATCH = 2
     """CUDA Graphs supported for batches that only contain query lengths that are
     the same, this can be used for spec-decode 
@@ -187,6 +192,7 @@ The following table lists backends that support full CUDA Graphs at the time of 
 | AITER MLA | `UNIFORM_SINGLE_TOKEN_DECODE` | |
 | CUTLASS MLA | `UNIFORM_SINGLE_TOKEN_DECODE` | |
 | Mamba attention | `UNIFORM_SINGLE_TOKEN_DECODE` | |
+| GDN attention | `VARLEN_DECODE` | Decode-only full capture, ragged per-request query lengths included (adaptive verification); mixed prefill-decode full capture is not supported |
 
 Unlisted backends are all declared as `NEVER`.
 

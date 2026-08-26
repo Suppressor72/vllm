@@ -37,6 +37,19 @@ class GDNAttentionBackend(AttentionBackend):
     def is_ssm(cls) -> bool:
         return True
 
+    @classmethod
+    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+        # Unlike other SSM backends, GDN's decode state path plans off the
+        # device query_start_loc: the metadata builder derives the
+        # state/query tensors from it, and the decode kernels (fused CUDA,
+        # Triton recurrent, causal conv) read per-request boundaries and
+        # the spec accept/reject rollback from GPU tensors. The CPU copies
+        # only feed classification counts and totals, which adaptive
+        # verification preserves. Relies on the scheduler guarantees
+        # max per-request device query len <= num_spec + 1 and
+        # num_accepted_tokens >= 1.
+        return True
+
 
 @dataclass
 class GDNAttentionMetadata:
@@ -81,7 +94,9 @@ class GDNAttentionMetadata:
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
     kv_cache_spec: MambaSpec
-    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+    # Varlen (ragged) decode full cudagraphs, e.g. adaptive verification
+    # spec-decode steps; mixed prefill-decode still runs below full capture.
+    _cudagraph_support = AttentionCGSupport.VARLEN_DECODE
 
     reorder_batch_threshold: int = 1
 

@@ -569,8 +569,13 @@ class AttentionCGSupport(Enum):
     Here we do not consider the cascade attention, as currently
     it is never cudagraph supported."""
 
-    ALWAYS = 3
+    ALWAYS = 4
     """Cudagraph always supported; supports mixed-prefill-decode"""
+    VARLEN_DECODE = 3
+    """Cudagraph supported for decode batches whose per-request query lengths
+    may differ (ragged/varlen decode), e.g. adaptive verification's trimmed
+    spec-decode windows. Mixed prefill-decode full capture still requires
+    ALWAYS."""
     UNIFORM_BATCH = 2
     """Cudagraph supported for batches the only contain query lengths that are
     the same, this can be used for spec-decode
