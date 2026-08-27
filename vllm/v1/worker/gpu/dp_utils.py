@@ -57,12 +57,13 @@ def sync_cudagraph_and_dp_padding(
     """
     assert dp_size > 1, "DP size must be greater than 1"
     group = get_dp_group().cpu_group
-    tensor = torch.zeros(5, dp_size, dtype=torch.int32, device="cpu")
+    tensor = torch.zeros(6, dp_size, dtype=torch.int32, device="cpu")
     tensor[0][dp_rank] = num_tokens
     tensor[1][dp_rank] = desired_batch_desc.cg_mode.value
     tensor[2][dp_rank] = uniform_token_count or 0  # (0 means None)
     tensor[3][dp_rank] = max_query_len or -1  # (-1 means None)
     tensor[4][dp_rank] = has_prefill
+    tensor[5][dp_rank] = num_reqs
     dist.all_reduce(tensor, group=group)
 
     num_tokens_across_dp = tensor[0]
@@ -70,6 +71,8 @@ def sync_cudagraph_and_dp_padding(
     uniform_token_counts_across_dp = tensor[2]
     max_query_lens_across_dp = tensor[3]
     has_prefill_across_dp = tensor[4]
+    # Ladder descriptors bind on num_reqs; ranks must agree on the bound.
+    synced_num_reqs = int(tensor[5].max().item())
     synced_has_prefill = bool(has_prefill_across_dp.any().item())
 
     # If ranks disagree on the uniform token count, or its 0 (means None) set to None
@@ -115,11 +118,10 @@ def sync_cudagraph_and_dp_padding(
     synced_max_query_len: int | None = None
     if bool(torch.all(max_query_lens_across_dp != -1).item()):
         synced_max_query_len = int(max_query_lens_across_dp.max().item())
-    # Dispatch for the final synced values, use num_reqs instead of synced_num_reqs
-    # so we don't perform request padding for PIECEWISE graphs.
-    # num_active_loras is per-rank and doesn't need cross-rank agreement.
+    # Dispatch with the synced request count so ladder rungs agree
+    # across ranks; PIECEWISE ignores it. LoRA counts are per-rank.
     synced_desc = cudagraph_manager.dispatch(
-        num_reqs,
+        synced_num_reqs,
         synced_num_tokens,
         synced_uniform_token_count,
         num_active_loras=num_active_loras,
