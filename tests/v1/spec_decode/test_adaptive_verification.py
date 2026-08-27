@@ -258,7 +258,7 @@ def test_manager_rejects_backend_without_varlen_decode_cudagraphs():
     )
     support = AttentionCGSupportInfo(AttentionCGSupport.UNIFORM_BATCH, "TargetBackend")
 
-    with pytest.raises(ValueError, match="VARLEN_DECODE or AttentionCGSupport.ALWAYS"):
+    with pytest.raises(ValueError, match="allows none"):
         maybe_create_adaptive_verification_manager(
             enable_adaptive_verification=True,
             attn_groups=[[group]],

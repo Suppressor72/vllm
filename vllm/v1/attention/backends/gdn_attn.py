@@ -20,12 +20,12 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+    max_decode_query_len,
 )
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     compute_causal_conv1d_metadata,
     mamba_get_block_table_tensor,
-    max_decode_query_len,
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec

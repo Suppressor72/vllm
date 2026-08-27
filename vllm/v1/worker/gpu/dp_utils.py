@@ -175,11 +175,12 @@ def sync_cudagraph_and_dp_padding(
     synced_max_query_len: int | None = None
     if bool(torch.all(max_query_lens_across_dp != -1)):
         synced_max_query_len = int(max_query_lens_across_dp.max())
-    # Dispatch for the final synced values, use num_reqs instead of synced_num_reqs
-    # so we don't perform request padding for PIECEWISE graphs.
+    # Ladder descriptors bind on num_reqs; ranks must agree on the bound so
+    # varlen capture geometry is honest across DP. PIECEWISE ignores it.
+    synced_num_reqs = int(num_reqs_across_dp.max())
     # num_active_loras is per-rank and doesn't need cross-rank agreement.
     synced_desc = cudagraph_manager.dispatch(
-        num_reqs,
+        synced_num_reqs,
         synced_num_tokens,
         synced_uniform_token_count,
         num_active_loras=num_active_loras,

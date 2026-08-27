@@ -17,11 +17,7 @@ from tests.v1.attention.utils import (
 )
 from vllm.config import SpeculativeConfig
 from vllm.config.compilation import CUDAGraphMode
-<<<<<<< HEAD
-from vllm.v1.attention.backend import CommonAttentionMetadata
-=======
-from vllm.v1.attention.backend import AttentionCGSupport
->>>>>>> 558c3dd9f4 (enable varlen decode cuda graphs for gdn)
+from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionBackend,
     GDNAttentionMetadata,
@@ -207,7 +203,11 @@ def test_gdn_advertises_varlen_decode_cudagraph_support():
     assert GDNAttentionBackend.supports_device_cpu_query_lens_mismatch()
     assert (
         GDNAttentionMetadataBuilder.get_cudagraph_support(None, None)
-        == AttentionCGSupport.VARLEN_DECODE
+        == AttentionCGSupport.UNIFORM_BATCH
+    )
+    assert (
+        GDNAttentionMetadataBuilder.get_varlen_cudagraph_max_query_len(None, None)
+        is not None
     )
 
 
