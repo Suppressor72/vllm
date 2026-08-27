@@ -608,6 +608,8 @@ class SpeculativeConfig:
             "dspark",
         )
         factors.append(uses_aux_hidden_states)
+        # Adaptive mode changes the captured graphs and the draft function.
+        factors.append(self.enable_adaptive_verification)
 
         if uses_aux_hidden_states and self.draft_model_config is not None:
             factors.append(self.draft_model_config.compute_hash())
