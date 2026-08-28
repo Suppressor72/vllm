@@ -313,3 +313,93 @@ def test_zero_budget_keeps_one_grammar_row_per_scheduled_draft():
     # (request, position) keys, so the kernel can mask rows the compacted
     # device layout no longer has room for.
     assert mapping == [0, 1, 2, 3, 4, 5, 6]
+
+
+def test_manager_gate_accepts_varlen_decode_support(monkeypatch):
+    """VARLEN_DECODE (GDN) satisfies the varlen-decode cudagraph
+    requirement without claiming mixed prefill-decode full capture."""
+    import torch
+
+    from vllm.v1.attention.backend import AttentionCGSupport
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend
+    from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
+    from vllm.v1.worker.gpu.spec_decode import adaptive_verification as av
+
+    sentinel = object()
+    monkeypatch.setattr(
+        av, "AdaptiveVerificationManager", lambda *args, **kwargs: sentinel
+    )
+    groups = [[SimpleNamespace(backend=GDNAttentionBackend)]]
+    for support in (AttentionCGSupport.VARLEN_DECODE, AttentionCGSupport.ALWAYS):
+        manager = av.maybe_create_adaptive_verification_manager(
+            enable_adaptive_verification=True,
+            attn_groups=groups,
+            vllm_config=None,
+            attn_cg_support=AttentionCGSupportInfo(support, "GDN_ATTN"),
+            req_states=object(),
+            query_start_loc=torch.zeros(4, dtype=torch.int32),
+            num_bonus_tokens=1,
+            max_total_logits=1024,
+        )
+        assert manager is sentinel
+
+
+def test_manager_gate_rejects_below_varlen_decode_support(monkeypatch):
+    import pytest
+    import torch
+
+    from vllm.v1.attention.backend import AttentionCGSupport
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend
+    from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
+    from vllm.v1.worker.gpu.spec_decode import adaptive_verification as av
+
+    monkeypatch.setattr(av, "AdaptiveVerificationManager", lambda *args, **kwargs: None)
+    groups = [[SimpleNamespace(backend=GDNAttentionBackend)]]
+    for support in (
+        AttentionCGSupport.UNIFORM_BATCH,
+        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE,
+        AttentionCGSupport.NEVER,
+    ):
+        with pytest.raises(ValueError, match="VARLEN_DECODE"):
+            av.maybe_create_adaptive_verification_manager(
+                enable_adaptive_verification=True,
+                attn_groups=groups,
+                vllm_config=None,
+            attn_cg_support=AttentionCGSupportInfo(support, "GDN_ATTN"),
+                req_states=object(),
+                query_start_loc=torch.zeros(4, dtype=torch.int32),
+                num_bonus_tokens=1,
+                max_total_logits=1024,
+            )
+
+
+def test_manager_gate_rejects_query_lens_mismatch_unsupported_backend(monkeypatch):
+    """The two boot gates are independent: a backend that still needs exact
+    CPU query lengths is rejected even at ALWAYS cg support."""
+    import pytest
+    import torch
+
+    from vllm.v1.attention.backend import AttentionCGSupport
+    from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
+    from vllm.v1.worker.gpu.spec_decode import adaptive_verification as av
+
+    class FakeSSMBackend:
+        @classmethod
+        def supports_device_cpu_query_lens_mismatch(cls):
+            return False
+
+    monkeypatch.setattr(av, "AdaptiveVerificationManager", lambda *args, **kwargs: None)
+    groups = [[SimpleNamespace(backend=FakeSSMBackend)]]
+    with pytest.raises(ValueError, match="FakeSSMBackend.*does not support"):
+        av.maybe_create_adaptive_verification_manager(
+            enable_adaptive_verification=True,
+            attn_groups=groups,
+            vllm_config=None,
+            attn_cg_support=AttentionCGSupportInfo(
+                AttentionCGSupport.ALWAYS, "FakeSSMBackend"
+            ),
+            req_states=object(),
+            query_start_loc=torch.zeros(4, dtype=torch.int32),
+            num_bonus_tokens=1,
+            max_total_logits=1024,
+        )

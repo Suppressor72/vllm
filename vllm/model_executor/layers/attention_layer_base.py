@@ -22,6 +22,10 @@ class AttentionLayerBase(ABC):
 
     impl: "AttentionImpl"
     supports_dcp: bool = True
+    # Construction-time compilation model role ("backbone", "dspark_head",
+    # ...). Set by subclasses under set_model_tag; read by attention
+    # metadata builders to classify target vs drafter groups.
+    _vllm_model_tag: str
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         """Bind the allocated KV cache tensor to this layer.
