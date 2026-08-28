@@ -539,7 +539,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_num_blocks_per_group.append(max_num_blocks)
 
         self.attn_groups, attn_cg_support, self.kernel_block_sizes = init_attn_backend(
-            self.kv_cache_config, self.vllm_config, self.device
+            self.kv_cache_config,
+            self.vllm_config,
+            self.device,
+            # The runner-resolved decode width is the authoritative bound for
+            # device-ragged adaptive decode (num_speculative_steps +
+            # num_new_sampled_tokens_per_step; a model-state property not
+            # visible on SpeculativeConfig).
+            decode_query_len=self.decode_query_len,
         )
         attn_cg_support = attn_cg_support.narrow(
             *self.model_state.get_additional_cg_support()
