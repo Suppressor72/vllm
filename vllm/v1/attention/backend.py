@@ -625,6 +625,14 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
         """Get the cudagraph support level of this builder class."""
         return cls._cudagraph_support
 
+    def _finalize_adaptive_decode(self, decode_query_len: int) -> None:
+        """Receive the runner-resolved decode width after runner init.
+
+        Default no-op; backends with device-ragged decode capability
+        override this to resolve their conditional mismatch mode.
+        """
+        return None
+
     def _init_reorder_batch_threshold(
         self,
         reorder_batch_threshold: int | None = 1,

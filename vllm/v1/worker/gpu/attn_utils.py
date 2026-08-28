@@ -145,16 +145,12 @@ def init_attn_backend(
                 num_metadata_builders=1,
             )
             builder = group.get_metadata_builder(0)
-            # Deferred adaptive-mismatch finalization (flashinfer-adaptive-
-            # mismatch W1 revision): every builder of the group receives the
-            # runner-resolved decode width and resolves its model role from
-            # the layers' construction-time tags. Builders without the hook
-            # are unaffected. (This path currently hard-codes one builder
-            # per group; the loop keeps that invariant correct if ubatching
-            # ever raises it.)
-            if decode_query_len is not None and hasattr(
-                builder, "_finalize_adaptive_decode"
-            ):
+            # Deferred adaptive-mismatch finalization: every builder of the
+            # group receives the runner-resolved decode width and resolves
+            # its model role from the layers' construction-time tags.
+            # (This path currently hard-codes one builder per group; the
+            # loop keeps that invariant correct if ubatching raises it.)
+            if decode_query_len is not None:
                 for group_builder in group.metadata_builders:
                     group_builder._finalize_adaptive_decode(decode_query_len)
             if attn_backend_workspace is None:

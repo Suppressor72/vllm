@@ -256,9 +256,7 @@ def test_manager_gate_rejects_below_varlen_decode_support(monkeypatch):
     from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
     from vllm.v1.worker.gpu.spec_decode import adaptive_verification as av
 
-    monkeypatch.setattr(
-        av, "AdaptiveVerificationManager", lambda *args, **kwargs: None
-    )
+    monkeypatch.setattr(av, "AdaptiveVerificationManager", lambda *args, **kwargs: None)
     groups = [[SimpleNamespace(backend=GDNAttentionBackend)]]
     for support in (
         AttentionCGSupport.UNIFORM_BATCH,
@@ -292,9 +290,7 @@ def test_manager_gate_rejects_query_lens_mismatch_unsupported_backend(monkeypatc
         def supports_device_cpu_query_lens_mismatch(cls):
             return False
 
-    monkeypatch.setattr(
-        av, "AdaptiveVerificationManager", lambda *args, **kwargs: None
-    )
+    monkeypatch.setattr(av, "AdaptiveVerificationManager", lambda *args, **kwargs: None)
     groups = [[SimpleNamespace(backend=FakeSSMBackend)]]
     with pytest.raises(ValueError, match="FakeSSMBackend.*does not support"):
         av.maybe_create_adaptive_verification_manager(
