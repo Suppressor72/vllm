@@ -191,6 +191,12 @@ class DFlash2Speculator(DFlashSpeculator):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
+        # Adaptive verification feeds from observed-acceptance history:
+        # DFlash2 checkpoints have no confidence head.
+        self.enable_adaptive_verification = (
+            self.speculative_config.enable_adaptive_verification
+        )
+        self.adaptive_confidence_source = "history"
         draft_config = self.draft_model_config.hf_config.dflash_config
         self.top_k = int(draft_config[self._candidate_top_k_key])
         self.candidate_sampler = CandidateSampler(
