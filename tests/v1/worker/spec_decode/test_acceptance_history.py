@@ -17,6 +17,12 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
+    _SELECTOR_CAL_KNOTS,
+    _SELECTOR_CAL_VALS,
+    apply_selector_calibration,
+    selector_acceptance_confidences,
+)
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AcceptanceHistoryEstimator,
     _assign_draft_token_budget,
@@ -220,3 +226,36 @@ def test_budget_geq_reservations():
     for argmax_b in (0, 3, 12, 21):
         budget = max(argmax_b, min(21, int(r.sum())))
         assert budget >= int(r.sum()) and budget <= 21
+
+
+# ---------------- selector provider + calibration ----------------
+
+
+def test_selector_confidences_shape_and_range():
+    scores = torch.randn(4, 7, 16)
+    p1 = selector_acceptance_confidences(scores)
+    assert p1.shape == (4, 7)
+    assert bool((p1 > 0).all()) and bool((p1 <= 1).all())
+    # top-1 of a softmax is always >= 1/K
+    assert bool((p1 >= 1.0 / 16 - 1e-6).all())
+
+
+def test_selector_calibration_monotone_and_clamped():
+    knots = torch.tensor(_SELECTOR_CAL_KNOTS, dtype=torch.float32)
+    vals = torch.tensor(_SELECTOR_CAL_VALS, dtype=torch.float32)
+    assert bool((torch.diff(vals) >= 0).all())  # monotone table
+    x = torch.linspace(0.0, 1.0, 1001)
+    y = apply_selector_calibration(x, knots, vals)
+    assert bool((torch.diff(y) >= 0).all())  # monotone map
+    assert y[0] == vals[0] and y[-1] == vals[-1]  # clamped
+    # inside the table: piecewise-constant steps at the knots
+    assert y[500] <= y[700] <= y[900]
+
+
+def test_selector_calibration_matches_fitted_endpoints():
+    knots = torch.tensor(_SELECTOR_CAL_KNOTS, dtype=torch.float32)
+    vals = torch.tensor(_SELECTOR_CAL_VALS, dtype=torch.float32)
+    y = apply_selector_calibration(torch.tensor([0.0, 0.3, 0.99, 1.0]), knots, vals)
+    assert y[0] == vals[0]
+    assert y[3] == vals[-1]
+    assert bool((y[1:3] >= vals[0]).all()) and bool((y[1:3] <= vals[-1]).all())

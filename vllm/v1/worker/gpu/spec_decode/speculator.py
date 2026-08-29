@@ -76,9 +76,10 @@ class DraftModelSpeculator(BaseSpeculator):
     # mode, so manager creation never silently no-ops), and
     # `adaptive_confidence_source` says where the manager's per-request
     # signal comes from: "head" (the speculator publishes per-step
-    # confidence probs, e.g. DSpark) or "history" (the manager derives
-    # censoring-aware conditionals from observed acceptance, for drafters
-    # without a confidence head, e.g. DFlash2).
+    # confidence probs, e.g. DSpark), "history" (the manager derives
+    # censoring-aware conditionals from observed acceptance), or
+    # "selector" (the speculator publishes calibrated selector-score
+    # confidences, e.g. DFlash2).
     enable_adaptive_verification: bool = False
     adaptive_confidence_source: str = "head"
 

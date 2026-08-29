@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import Any
 
 import torch
@@ -10,6 +11,76 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+
+
+# Calibrated acceptance map for the selector provider: binned monotone
+# (20 quantile bins, PAVA via cumulative max) fit on the adaptive-dflash
+# P2.2a-reliable training split (2026-08-29, logs/p2_obs2, n=4478; held-out
+# Brier 0.132 / AUC 0.864). Input feature: softmax top-1 over the realized
+# top-k selector scores. Disable with VLLM_ADAPTIVE_SELECTOR_CALIBRATION=0.
+_SELECTOR_CAL_KNOTS = (
+    0.2629,
+    0.4122,
+    0.4988,
+    0.5702,
+    0.6351,
+    0.7004,
+    0.7657,
+    0.8271,
+    0.8772,
+    0.9179,
+    0.9493,
+    0.9694,
+    0.9834,
+    0.9925,
+    0.9971,
+    0.9991,
+    0.9998,
+    1.0,
+    1.0,
+    1.0,
+)
+_SELECTOR_CAL_VALS = (
+    0.2589,
+    0.2589,
+    0.4196,
+    0.4464,
+    0.5357,
+    0.5848,
+    0.6368,
+    0.6652,
+    0.7054,
+    0.7545,
+    0.8296,
+    0.8844,
+    0.9367,
+    0.9507,
+    0.9862,
+    0.9863,
+    0.9863,
+    0.9935,
+    0.9935,
+    0.9983,
+)
+
+
+def selector_acceptance_confidences(selector_scores: torch.Tensor) -> torch.Tensor:
+    """Per-position acceptance estimate from realized selector scores.
+
+    Softmax over the top-k realized scores, take the top-1 value: the
+    probability mass the selector places on its best candidate at each
+    speculative position (the selected path token is that candidate
+    under greedy sampling).
+    """
+    return torch.softmax(selector_scores.float(), dim=-1).max(dim=-1).values
+
+
+def apply_selector_calibration(
+    p1: torch.Tensor, knots: torch.Tensor, vals: torch.Tensor
+) -> torch.Tensor:
+    """Piecewise-constant monotone map (right-continuous, clamped)."""
+    idx = torch.searchsorted(knots, p1.contiguous(), right=True).clamp(1, len(knots))
+    return vals[idx - 1]
 
 
 @triton.jit
@@ -116,7 +187,24 @@ class DFlash2Speculator(DFlashSpeculator):
         self.enable_adaptive_verification = (
             self.speculative_config.enable_adaptive_verification
         )
-        self.adaptive_confidence_source = "history"
+        # Acceptance-estimate provider: selector by default (the P2.2
+        # held-out winner), history selectable via config.
+        self.adaptive_confidence_source = (
+            self.speculative_config.adaptive_confidence_source or "selector"
+        )
+        if self.enable_adaptive_verification:
+            self.draft_token_confidence_probs = torch.empty_like(
+                self.draft_tokens, dtype=torch.float32
+            )
+            self._selector_cal_knots = torch.tensor(
+                _SELECTOR_CAL_KNOTS, dtype=torch.float32, device=device
+            )
+            self._selector_cal_vals = torch.tensor(
+                _SELECTOR_CAL_VALS, dtype=torch.float32, device=device
+            )
+            self._selector_calibrate = (
+                os.environ.get("VLLM_ADAPTIVE_SELECTOR_CALIBRATION", "1") != "0"
+            )
         draft_config = self.draft_model_config.hf_config.dflash_config
         self.selector_top_k = int(draft_config["selector_top_k"])
         self._anchor_indices = (
@@ -217,5 +305,15 @@ class DFlash2Speculator(DFlashSpeculator):
             anchor_token_ids,
         )
         self._sample_path(candidate_ids, scores, num_reqs)
+        if (
+            self.enable_adaptive_verification
+            and self.adaptive_confidence_source == "selector"
+        ):
+            p1 = selector_acceptance_confidences(self._selector_scores[:num_reqs])
+            if self._selector_calibrate:
+                p1 = apply_selector_calibration(
+                    p1, self._selector_cal_knots, self._selector_cal_vals
+                )
+            self.draft_token_confidence_probs[:num_reqs] = p1
         if self.draft_logits is not None:
             self._cache_draft_logits(candidate_ids, num_sample)

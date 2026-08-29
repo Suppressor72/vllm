@@ -1953,12 +1953,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             if (
                 self.adaptive_verification is not None
-                and self.adaptive_verification.confidence_source == "head"
+                and self.adaptive_verification.confidence_source != "history"
             ):
-                # Head mode only: the speculator publishes per-step
-                # confidence probs during drafting. History-mode
-                # drafters have no such attribute (and no drafting-side
-                # signal at all).
+                # Speculator-provided confidence (head: DSpark's learned
+                # head; selector: DFlash2's calibrated selector softmax).
+                # History mode has no drafting-side signal at all.
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
