@@ -346,6 +346,13 @@ class AdaptiveVerificationManager:
         )
         self._num_non_draft_tokens = torch.empty_like(query_start_loc[:-1])
         self._cu_num_logits = torch.empty_like(query_start_loc)
+        # Exploration/audit arm (benchmark/debug ONLY, default off):
+        # with probability _audit_pct, an eligible trimmed step verifies
+        # FULL width instead, yielding uncensored per-slot observations.
+        # Fixed seed: TP replicas execute the identical call sequence,
+        # so both ranks draw the same audit steps and stay lockstep.
+        self._audit_pct = float(_history_env("VLLM_ADAPTIVE_AUDIT_FULL_WIDTH_PCT", "0"))
+        self._audit_rng = np.random.default_rng(0x5EED)
 
         # Two D2H slots preserve stale inputs for budget selection.
         self._stale_confidences = [
@@ -626,6 +633,25 @@ class AdaptiveVerificationManager:
                 max(0, max_draft_budget // max(1, int((scheduled_drafts > 0).sum()))),
             )
         draft_budget = max(argmax_budget, min(max_draft_budget, reserved_total))
+        # Audit arm: occasionally override the trim with full width so
+        # censored positions get observed. Eligible = a verifying step
+        # the policy actually trimmed; each audit step is logged for the
+        # policy-vs-audit estimator comparison.
+        scheduled_total = int(scheduled_drafts.sum())
+        if (
+            self._audit_pct > 0
+            and scheduled_total > 0
+            and draft_budget < min(scheduled_total, max_draft_budget)
+            and self._audit_rng.random() < self._audit_pct
+        ):
+            forced = min(scheduled_total, max_draft_budget)
+            logger.info(
+                "ADFLASH-AUDIT-FULL-WIDTH reqs=%d policy_budget=%d forced=%d",
+                num_reqs,
+                draft_budget,
+                forced,
+            )
+            draft_budget = forced
         self._batch_budget = (
             num_drafts_per_req,
             num_non_draft_tokens_per_req,
