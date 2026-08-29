@@ -202,12 +202,6 @@ class DFlash2Speculator(DFlashSpeculator):
             self.speculative_config.adaptive_confidence_source or "selector"
         )
         if self.enable_adaptive_verification:
-            logger.info(
-                "DFlash2 adaptive acceptance provider: source=%s calibrated=%s",
-                self.adaptive_confidence_source,
-                self._selector_calibrate,
-            )
-        if self.enable_adaptive_verification:
             self.draft_token_confidence_probs = torch.empty_like(
                 self.draft_tokens, dtype=torch.float32
             )
@@ -219,6 +213,12 @@ class DFlash2Speculator(DFlashSpeculator):
             )
             self._selector_calibrate = (
                 os.environ.get("VLLM_ADAPTIVE_SELECTOR_CALIBRATION", "1") != "0"
+            )
+        if self.enable_adaptive_verification:
+            logger.info(
+                "DFlash2 adaptive acceptance provider: source=%s calibrated=%s",
+                self.adaptive_confidence_source,
+                self._selector_calibrate,
             )
         draft_config = self.draft_model_config.hf_config.dflash_config
         self.selector_top_k = int(draft_config["selector_top_k"])
