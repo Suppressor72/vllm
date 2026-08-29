@@ -7,17 +7,26 @@ from typing import Any
 import torch
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.config.compilation import CUDAGraphMode
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
 
-# Calibrated acceptance map for the selector provider: binned monotone
-# (20 quantile bins, PAVA via cumulative max) fit on the adaptive-dflash
-# P2.2a-reliable training split (2026-08-29, logs/p2_obs2, n=4478; held-out
-# Brier 0.132 / AUC 0.864). Input feature: softmax top-1 over the realized
-# top-k selector scores. Disable with VLLM_ADAPTIVE_SELECTOR_CALIBRATION=0.
+logger = init_logger(__name__)
+
+# Calibrated acceptance map for the selector provider: 20 quantile bins
+# on raw centers (empty bins retained as plateaus), monotone via
+# cumulative max (a weighted-PAVA refit scores within 0.002 AUC / 0.001
+# Brier). Fit on the adaptive-dflash P2.2a-reliable training split
+# (2026-08-29, logs/p2_obs2, n=4478; operational held-out Brier 0.133 /
+# AUC 0.862). Input feature: softmax top-1 over the realized top-k
+# selector scores = the BEST candidate's confidence (under greedy
+# sampling the selected path token; under temperature the walk may
+# differ — self-consistent with the calibration data, but estimates
+# best-candidate confidence, not selected-token confidence). Disable
+# with VLLM_ADAPTIVE_SELECTOR_CALIBRATION=0.
 _SELECTOR_CAL_KNOTS = (
     0.2629,
     0.4122,
@@ -192,6 +201,12 @@ class DFlash2Speculator(DFlashSpeculator):
         self.adaptive_confidence_source = (
             self.speculative_config.adaptive_confidence_source or "selector"
         )
+        if self.enable_adaptive_verification:
+            logger.info(
+                "DFlash2 adaptive acceptance provider: source=%s calibrated=%s",
+                self.adaptive_confidence_source,
+                self._selector_calibrate,
+            )
         if self.enable_adaptive_verification:
             self.draft_token_confidence_probs = torch.empty_like(
                 self.draft_tokens, dtype=torch.float32
