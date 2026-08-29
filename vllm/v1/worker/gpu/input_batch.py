@@ -135,6 +135,7 @@ class InputBatch:
         # too; attention metadata is built from the promised max_query_len.
         use_max_window_layout = max_query_len is not None and num_reqs > 1
         if use_max_window_layout:
+            assert max_query_len is not None  # for mypy (flag implies a window)
             # Exercise the promised window: one largest request, the
             # remainder spread over the others within the cap.
             big = min(max_query_len, num_tokens - (num_reqs - 1))
