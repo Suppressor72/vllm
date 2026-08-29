@@ -71,6 +71,17 @@ class BaseSpeculator(ABC):
 
 
 class DraftModelSpeculator(BaseSpeculator):
+    # Adaptive-verification contract: `enable_adaptive_verification` holds
+    # the EFFECTIVE flag (False for speculators that cannot feed adaptive
+    # mode, so manager creation never silently no-ops), and
+    # `adaptive_confidence_source` says where the manager's per-request
+    # signal comes from: "head" (the speculator publishes per-step
+    # confidence probs, e.g. DSpark) or "history" (the manager derives
+    # censoring-aware conditionals from observed acceptance, for drafters
+    # without a confidence head, e.g. DFlash2).
+    enable_adaptive_verification: bool = False
+    adaptive_confidence_source: str = "head"
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
         self.device = device

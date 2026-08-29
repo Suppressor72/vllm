@@ -526,8 +526,24 @@ class SpeculativeConfig:
     Mutually exclusive with synthetic_acceptance_rates."""
 
     enable_adaptive_verification: bool = False
-    """Whether to adaptively size the draft-verification budget from per-request
-    confidence. Currently only supported for method="dspark"."""
+    """Whether to adaptively size the draft-verification budget per request.
+    Supported for method="dspark" (speculator confidence head) and for DFlash2
+    drafts (observed-acceptance history; DFlash2 checkpoints have no head)."""
+
+    adaptive_min_draft_width: int = 0
+    """Floor on the per-request verify budget, in draft tokens (0 = off).
+    While the number of verifying requests is at most
+    adaptive_min_width_max_reqs, trimming never reduces a verifying
+    request below this width (its best positions are reserved before
+    the global top-k ranks the rest). Best-effort under the sampler
+    logits-chunk cap: reservations scale down with a one-time
+    warning."""
+
+    adaptive_min_width_max_reqs: int = 2
+    """Concurrency ceiling for adaptive_min_draft_width: the floor is
+    active only while the number of verifying requests in the batch is
+    at most this value. Above it the cost-model argmax owns the
+    decision (burst trimming stays possible)."""
 
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
@@ -610,6 +626,10 @@ class SpeculativeConfig:
         factors.append(uses_aux_hidden_states)
         # Adaptive mode changes the captured graphs and the draft function.
         factors.append(self.enable_adaptive_verification)
+        # The width floor changes the allocation kernel's admitted-draft
+        # output whenever it is active; hash it like the flag.
+        factors.append(self.adaptive_min_draft_width)
+        factors.append(self.adaptive_min_width_max_reqs)
 
         if uses_aux_hidden_states and self.draft_model_config is not None:
             factors.append(self.draft_model_config.compute_hash())
@@ -1459,8 +1479,34 @@ class SpeculativeConfig:
                     )
                 )
 
-        if self.method != "dspark" and self.enable_adaptive_verification:
-            raise ValueError("Adaptive verification only supported with DSpark")
+        if self.enable_adaptive_verification:
+            has_dflash2_draft = (
+                self.method == "dflash"
+                and self.draft_model_config is not None
+                and "DFlash2DraftModel" in (self.draft_model_config.architectures or [])
+            )
+            if self.method != "dspark" and not has_dflash2_draft:
+                raise ValueError(
+                    "Adaptive verification is supported with DSpark (confidence "
+                    "head) and with DFlash2 drafts (observed-acceptance "
+                    "history); other drafters are not wired up."
+                )
+            if self.adaptive_min_draft_width:
+                if self.adaptive_min_draft_width < 0:
+                    raise ValueError(
+                        "adaptive_min_draft_width must be >= 0 "
+                        f"(got {self.adaptive_min_draft_width})."
+                    )
+                if self.adaptive_min_width_max_reqs < 0:
+                    raise ValueError(
+                        "adaptive_min_width_max_reqs must be >= 0 "
+                        f"(got {self.adaptive_min_width_max_reqs})."
+                    )
+            elif self.adaptive_min_width_max_reqs != 2:
+                raise ValueError(
+                    "adaptive_min_width_max_reqs only applies together with "
+                    "adaptive_min_draft_width > 0."
+                )
 
         return self
 

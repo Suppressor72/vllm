@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Adaptive verification for DSpark speculative decoding."""
 
+import os
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING
@@ -14,6 +15,7 @@ from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.v1.attention.backend import AttentionCGSupport
+from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu.async_utils import StepTimingSample, stream
 from vllm.v1.worker.gpu.attn_utils import (
@@ -39,6 +41,8 @@ def _assign_draft_token_budget(
     capacities: torch.Tensor,
     draft_budget: int,
     num_steps: int,
+    reserved: torch.Tensor | None = None,
+    reserved_total: int = 0,
 ) -> None:
     """Admit the globally best `draft_budget` draft slots, in place.
 
@@ -46,6 +50,11 @@ def _assign_draft_token_budget(
     product of that request's per-position confidences, and the highest scores win.
     Survival only decreases along a request, so a global top-k always admits
     continuously along steps with a request.
+
+    When `reserved` carries per-request reserved counts (total `reserved_total`,
+    both host-known), each request's first reserved[i] positions — exactly its
+    best — are pre-admitted and the top-k fills only the remainder of the budget.
+    With reserved_total == 0 the original pure top-k runs unchanged.
 
     `capacities` enters holding each request's scheduled draft count (which bounds its
     eligible slots) and leaves holding the admitted count. The caller only calls this
@@ -57,14 +66,159 @@ def _assign_draft_token_budget(
     out_of_range = steps[None, :] >= capacities[:, None]
     survival = survival.masked_fill(out_of_range, -float("inf"))
     flat = survival.flatten()
-    winners = flat.topk(draft_budget).indices
-    admitted = torch.zeros_like(flat, dtype=torch.bool).index_fill_(0, winners, True)
+    if reserved_total > 0:
+        assert reserved is not None
+        reserved_mask = steps[None, :] < reserved[:, None]
+        reserved_mask &= ~out_of_range
+        # Reserved slots are already admitted; rank only the rest.
+        scores = flat.masked_fill(reserved_mask.flatten(), -float("inf"))
+        remaining = draft_budget - reserved_total
+        admitted = reserved_mask.flatten().clone()
+        if remaining > 0:
+            winners = scores.topk(remaining).indices
+            admitted.index_fill_(0, winners, True)
+    else:
+        winners = flat.topk(draft_budget).indices
+        admitted = torch.zeros_like(flat, dtype=torch.bool).index_fill_(
+            0, winners, True
+        )
     torch.sum(admitted.view_as(survival), dim=1, dtype=capacities.dtype, out=capacities)
 
 
 _assign_draft_token_budget_compiled = torch.compile(
     _assign_draft_token_budget, dynamic=True
 )
+
+
+def _min_width_reservation(
+    scheduled_drafts: np.ndarray,
+    min_width: int,
+    max_verifying_reqs: int,
+    max_draft_budget: int,
+) -> np.ndarray:
+    """Per-request reserved draft counts for the concurrency-gated width
+    floor (all zeros when the floor is off).
+
+    The floor is active only while the number of VERIFYING requests
+    (scheduled drafts > 0) is at most `max_verifying_reqs`; each such
+    request reserves min(min_width, its scheduled count). Non-verifying
+    rows always reserve zero. Under the sampler logits-chunk cap the
+    reservation is best-effort: each request's reserve scales down to
+    ``max_draft_budget // num_verifying``.
+    """
+    num_verifying = int((scheduled_drafts > 0).sum())
+    if min_width <= 0 or num_verifying == 0 or num_verifying > max_verifying_reqs:
+        return np.zeros_like(scheduled_drafts)
+    reserved = np.minimum(scheduled_drafts, min_width)
+    total = int(reserved.sum())
+    if total > max_draft_budget:
+        per_request_cap = max_draft_budget // num_verifying
+        reserved = np.minimum(reserved, per_request_cap)
+    return reserved
+
+
+def _history_env(name: str, default: str) -> str:
+    return os.environ.get(name, default)
+
+
+class AcceptanceHistoryEstimator:
+    """Censoring-aware per-request acceptance history (history mode).
+
+    Tracks, per request slot, a filtered EMA of ind(accepted >= p) over
+    steps that REACHED p-1 with position p actually verified — the
+    Kaplan-Meier-style predicate ``admitted >= p AND accepted >= p-1``.
+    A step that died before p-1, or whose death coincided with the trim
+    boundary, simply skips that position's update: unreached is not
+    rejected. Chunked-prefill rows are skipped entirely upstream (their
+    ``num_rejected`` is force-zeroed by the sampling kernel).
+
+    The stored values are CONDITIONAL per-position probabilities
+    q_p = P(accept_p | reached p-1): both budget consumers cumprod their
+    inputs into survival, so storing survival indicators would
+    double-compose. A manager-local pooled unconditional histogram
+    (converted with the shared ``unconditional_to_conditional_rates``
+    helper) seeds cold requests, shrinking to the seed by observation
+    count; an empty pool seeds q=1.0 (full-width-biased, matching the
+    per-request warmup pin). The scalar-mean minimum-variance ladder is
+    deliberately NOT used as a seed: its exact zero tails are absorbing
+    under censoring.
+    """
+
+    def __init__(
+        self,
+        num_slots: int,
+        num_steps: int,
+        alpha: float,
+        min_count: int,
+        warmup_steps: int,
+    ) -> None:
+        self.num_steps = num_steps
+        self.alpha = alpha
+        self.min_count = min_count
+        self.warmup_steps = warmup_steps
+        self._ema = np.ones((num_slots, num_steps), dtype=np.float64)
+        self._steps = np.zeros(num_slots, dtype=np.int64)
+        # Pooled unconditional ladder: P(accepted >= p) over all
+        # request-steps where the KM predicate admitted the update.
+        self._pool_num = np.zeros(num_steps, dtype=np.int64)
+        self._pool_den = np.zeros(num_steps, dtype=np.int64)
+
+    def reset(self, slot: int) -> None:
+        self._ema[slot].fill(1.0)
+        self._steps[slot] = 0
+
+    def update(self, slot: int, admitted: int, accepted: int) -> None:
+        """Apply one (admitted, accepted) observation for a request.
+
+        `admitted` is the verify width that actually ran; `accepted`
+        the surviving prefix length (accepted <= admitted).
+        """
+        if admitted <= 0:
+            return
+        self._steps[slot] += 1
+        for p in range(1, self.num_steps + 1):
+            if admitted >= p and accepted >= p - 1:
+                survived = 1.0 if accepted >= p else 0.0
+                ema = self._ema[slot, p - 1]
+                self._ema[slot, p - 1] = (1.0 - self.alpha) * ema + self.alpha * (
+                    survived
+                )
+                self._pool_num[p - 1] += int(accepted >= p)
+                self._pool_den[p - 1] += 1
+
+    def _seed(self) -> np.ndarray:
+        """Pooled unconditional ladder -> conditional seed (q=1 if empty)."""
+        if (self._pool_den > 0).any():
+            unconditional = np.divide(
+                self._pool_num,
+                self._pool_den,
+                out=np.zeros(self.num_steps, dtype=np.float64),
+                where=self._pool_den > 0,
+            ).clip(0.0, 1.0)
+            ladder = np.asarray(
+                unconditional_to_conditional_rates(unconditional.tolist()),
+                dtype=np.float64,
+            ).clip(0.0, 1.0)
+            # Only trust pooled positions with observations; a position
+            # is observed whenever any later position is. Unobserved
+            # positions seed optimistically (q=1): they are censored,
+            # not zero.
+            ladder[self._pool_den == 0] = 1.0
+            return ladder
+        return np.ones(self.num_steps, dtype=np.float64)
+
+    def conditionals(self, slots: np.ndarray) -> np.ndarray:
+        """Shrunk conditional q_p for the given slots, shape (len(slots), K)."""
+        seed = self._seed()
+        counts = self._steps[slots].astype(np.float64)
+        confidence = counts / (counts + self.min_count)
+        raw = self._ema[slots]
+        return (
+            confidence[:, None] * raw + (1.0 - confidence)[:, None] * seed[None, :]
+        ).clip(0.0, 1.0)
+
+    def is_cold(self, slots: np.ndarray) -> np.ndarray:
+        return self._steps[slots] < self.warmup_steps
 
 
 def build_cost_tables_from_curves(
@@ -120,6 +274,9 @@ class AdaptiveVerificationManager:
         query_start_loc: torch.Tensor,
         num_bonus_tokens: int,
         max_total_logits: int,
+        min_draft_width: int = 0,
+        min_width_max_reqs: int = 2,
+        confidence_source: str = "head",
     ):
         self.req_states = req_states
         self.num_speculative_steps = req_states.num_speculative_steps
@@ -127,6 +284,44 @@ class AdaptiveVerificationManager:
         self._copy_stream = torch.cuda.Stream(device)
 
         self.num_bonus_tokens = num_bonus_tokens
+        # Concurrency-gated width floor (0 disables; see
+        # _min_width_reservation for the exact semantics).
+        self.min_draft_width = min_draft_width
+        self.min_width_max_reqs = min_width_max_reqs
+        self._floor_cap_warned = False
+        # "head": the speculator publishes per-step confidence probs
+        # (DSpark). "history": the manager derives censoring-aware
+        # per-request conditionals from observed acceptance (DFlash2,
+        # which has no confidence head).
+        self.confidence_source = confidence_source
+        self._history: AcceptanceHistoryEstimator | None = None
+        self._hist_bufs: list[CpuGpuBuffer] | None = None
+        self._hist_events: list[torch.cuda.Event] | None = None
+        self._hist_idx = 0
+        self._hist_pending_resets: list[int] = []
+        if confidence_source == "history":
+            self._history = AcceptanceHistoryEstimator(
+                req_states.max_num_reqs,
+                self.num_speculative_steps,
+                alpha=float(_history_env("VLLM_ADAPTIVE_HISTORY_ALPHA", "0.15")),
+                min_count=int(_history_env("VLLM_ADAPTIVE_HISTORY_MIN_COUNT", "8")),
+                warmup_steps=int(
+                    _history_env("VLLM_ADAPTIVE_HISTORY_WARMUP_STEPS", "8")
+                ),
+            )
+            # Dedicated int32 D2H slots: rows 0/1 = (num_rejected,
+            # admitted_width), both per batch row. Never packed into the
+            # float32 confidence matrices.
+            self._hist_bufs = [
+                CpuGpuBuffer(
+                    2,
+                    req_states.max_num_reqs,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                for _ in range(2)
+            ]
+            self._hist_events = [torch.cuda.Event(blocking=True) for _ in range(2)]
         # Rejection sampling verifies logits in one contiguous chunk; the
         # chunked path indexes by scheduled (untrimmed) offsets and cannot
         # address the compacted layout, so the budget must fit one chunk.
@@ -144,6 +339,9 @@ class AdaptiveVerificationManager:
             device=device,
         )
         self._batch_draft_capacity = torch.empty(
+            max_num_reqs, dtype=torch.int32, device=device
+        )
+        self._reserved_drafts = torch.empty(
             max_num_reqs, dtype=torch.int32, device=device
         )
         self._num_non_draft_tokens = torch.empty_like(query_start_loc[:-1])
@@ -169,6 +367,9 @@ class AdaptiveVerificationManager:
         self._stale_confidences[self._stale_idx].np[req_idx].fill(1.0)
         self._pending_resets.append(req_idx)
         self._confidence_probs[req_idx].fill_(1.0)
+        if self._history is not None:
+            self._history.reset(req_idx)
+            self._hist_pending_resets.append(req_idx)
 
     def batches_to_profile(self, capture_sizes: list[int]) -> Iterator[dict[str, int]]:
         """Dummy-run kwargs whose step timings seed the cost tables.
@@ -266,6 +467,54 @@ class AdaptiveVerificationManager:
             write_slot.copy_to_cpu()
             self._copy_events[write_idx].record()
 
+    def record_acceptance(
+        self,
+        num_rejected: torch.Tensor,
+        input_batch: "InputBatch",
+    ) -> None:
+        """History mode: ingest this step's per-row verify outcomes.
+
+        `num_rejected` (device, batch-row order) pairs with the admitted
+        widths the allocator chose this step (`_batch_draft_capacity`,
+        still valid post-verify). One (num_rejected, admitted) int32 pair
+        per row goes to the CPU through the same double-buffer + event +
+        side-stream discipline as the head confidences; the landed
+        previous-step pair feeds the estimator below. Rows still in
+        chunked prefill are skipped — the sampling kernel zeroes their
+        num_rejected, which would read as fake full-accepts.
+        """
+        assert self._history is not None and self._hist_bufs is not None
+        num_reqs = input_batch.num_reqs
+        ready_idx = self._hist_idx ^ 1
+        with gpu_sync_allowed():
+            self._hist_events[ready_idx].synchronize()
+        landed = self._hist_bufs[ready_idx]
+        if self._hist_pending_resets:
+            for slot in self._hist_pending_resets:
+                self._history.reset(slot)
+            self._hist_pending_resets.clear()
+        # The landed slot holds the PREVIOUS step's outcomes (one step
+        # stale, mirroring head mode): apply the censored updates now.
+        slots_np = input_batch.idx_mapping.cpu().numpy()
+        rejected_np = landed.np[0, :num_reqs]
+        admitted_np = landed.np[1, :num_reqs]
+        for row in range(num_reqs):
+            slot = int(slots_np[row])
+            admitted = int(admitted_np[row])
+            accepted = admitted - int(rejected_np[row])
+            self._history.update(slot, admitted, accepted)
+        # Rotate: read the landed slot next time, write this step into
+        # the slot nothing reads.
+        self._hist_idx, write_idx = ready_idx, self._hist_idx
+        write_slot = self._hist_bufs[write_idx]
+        write_slot.gpu[0, :num_reqs].copy_(num_rejected[:num_reqs])
+        write_slot.gpu[1, :num_reqs].copy_(self._batch_draft_capacity[:num_reqs])
+        current_stream = torch.cuda.current_stream(self.req_states.device)
+        self._copy_stream.wait_stream(current_stream)
+        with stream(self._copy_stream, current_stream):
+            write_slot.copy_to_cpu()
+            self._hist_events[write_idx].record()
+
     def get_num_tokens(
         self,
         num_tokens_per_req: dict[str, int],
@@ -293,7 +542,17 @@ class AdaptiveVerificationManager:
             dtype=np.int32,
             count=len(req_ids),
         )
-        stale_confidences = self._stale_confidences[self._stale_idx].np[slots]
+        if self._history is not None:
+            stale_confidences = self._history.conditionals(slots)
+            # Mirror the conditionals into the GPU rank kernel's buffer
+            # (head mode refreshes it per record_confidences; history
+            # mode refreshes it at budget time).
+            slots_t = torch.from_numpy(slots.astype(np.int64))
+            self._confidence_probs[slots_t] = torch.from_numpy(
+                stale_confidences.astype(np.float32)
+            )
+        else:
+            stale_confidences = self._stale_confidences[self._stale_idx].np[slots]
         survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
         steps = np.arange(self.num_speculative_steps)
         valid = steps[None, :] < scheduled_drafts[:, None]
@@ -328,11 +587,50 @@ class AdaptiveVerificationManager:
             req_id: int(num_tokens)
             for req_id, num_tokens in zip(req_ids, num_non_draft_tokens, strict=True)
         }
-        draft_budget = int(np.argmax(num_tokens_to_estimated_accepted_tokens / costs))
+        argmax_budget = int(np.argmax(num_tokens_to_estimated_accepted_tokens / costs))
+        # ONE mode-split reservation vector (a single code path):
+        #   floor term — active while verifying requests <= max_reqs
+        #     (mode-independent);
+        #   history-only terms — cold-request warmup pin (scheduled
+        #     width) and the min-1 starvation guard for verifying rows
+        #     (censoring is what makes admitted=0 absorbing; the head
+        #     keeps emitting scores after a 0-width step, so head mode
+        #     reserves nothing and stays byte-identical at F=0).
+        floor_res = _min_width_reservation(
+            scheduled_drafts,
+            self.min_draft_width,
+            self.min_width_max_reqs,
+            max_draft_budget,
+        )
+        if self._history is not None:
+            cold = self._history.is_cold(slots)
+            history_res = np.where(
+                cold, scheduled_drafts, (scheduled_drafts > 0).astype(np.int32)
+            )
+        else:
+            history_res = np.zeros_like(scheduled_drafts)
+        reserved = np.minimum(scheduled_drafts, np.maximum(floor_res, history_res))
+        reserved_total = int(reserved.sum())
+        if (
+            reserved_total > 0
+            and int(np.minimum(scheduled_drafts, self.min_draft_width).sum())
+            > max_draft_budget
+            and not self._floor_cap_warned
+        ):
+            self._floor_cap_warned = True
+            logger.warning(
+                "Adaptive width floor scaled down: reservations %d exceed the "
+                "logits-chunk budget %d; per-request reserves capped at %d.",
+                int(np.minimum(scheduled_drafts, self.min_draft_width).sum()),
+                max_draft_budget,
+                max(0, max_draft_budget // max(1, int((scheduled_drafts > 0).sum()))),
+            )
+        draft_budget = max(argmax_budget, min(max_draft_budget, reserved_total))
         self._batch_budget = (
             num_drafts_per_req,
             num_non_draft_tokens_per_req,
             draft_budget,
+            {req_id: int(r) for req_id, r in zip(req_ids, reserved, strict=True)},
         )
         return sum(num_non_draft_tokens_per_req.values()) + draft_budget
 
@@ -350,7 +648,7 @@ class AdaptiveVerificationManager:
         """
         batch_budget = self._batch_budget
         assert batch_budget is not None
-        _, _, draft_budget = batch_budget
+        _, _, draft_budget, _reserved = batch_budget
         num_drafts = int(num_draft_tokens_per_req.sum())
         if draft_budget == num_drafts:
             return num_scheduled_tokens, cu_num_logits_np
@@ -381,7 +679,12 @@ class AdaptiveVerificationManager:
     ) -> tuple[torch.Tensor, torch.Tensor, int]:
         batch_budget, self._batch_budget = self._batch_budget, None
         assert batch_budget is not None
-        num_drafts_per_req, num_non_draft_tokens_per_req, draft_budget = batch_budget
+        (
+            num_drafts_per_req,
+            num_non_draft_tokens_per_req,
+            draft_budget,
+            reserved_per_req,
+        ) = batch_budget
         num_reqs = idx_mapping.shape[0]
         scheduled_drafts = np.fromiter(
             (num_drafts_per_req[req_id] for req_id in req_ids),
@@ -404,12 +707,24 @@ class AdaptiveVerificationManager:
         else:
             async_copy_to_gpu(scheduled_drafts, out=capacities)
             if draft_budget < int(scheduled_drafts.sum()):
+                reserved_np = np.fromiter(
+                    (reserved_per_req.get(req_id, 0) for req_id in req_ids),
+                    dtype=np.int32,
+                    count=num_reqs,
+                )
+                reserved_total = int(reserved_np.sum())
+                reserved_gpu = None
+                if reserved_total > 0:
+                    reserved_gpu = self._reserved_drafts[:num_reqs]
+                    async_copy_to_gpu(reserved_np, out=reserved_gpu)
                 _assign_draft_token_budget_compiled(
                     self._confidence_probs,
                     idx_mapping,
                     capacities,
                     draft_budget,
                     self.num_speculative_steps,
+                    reserved_gpu,
+                    reserved_total,
                 )
 
         num_non_draft_tokens_gpu = self._num_non_draft_tokens[:num_reqs]
@@ -449,6 +764,7 @@ def maybe_create_adaptive_verification_manager(
     vllm_config: "VllmConfig",
     target_layer_names: set[str] | None = None,
     additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,
+    confidence_source: str = "head",
 ) -> AdaptiveVerificationManager | None:
     if not enable_adaptive_verification:
         return None
@@ -492,9 +808,14 @@ def maybe_create_adaptive_verification_manager(
             "use a backend that does."
         )
 
+    spec_config = vllm_config.speculative_config
+    assert spec_config is not None
     return AdaptiveVerificationManager(
         req_states,
         query_start_loc,
         num_bonus_tokens,
         max_total_logits=max_total_logits,
+        min_draft_width=getattr(spec_config, "adaptive_min_draft_width", 0),
+        min_width_max_reqs=getattr(spec_config, "adaptive_min_width_max_reqs", 2),
+        confidence_source=confidence_source,
     )

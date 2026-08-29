@@ -595,6 +595,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             vllm_config=self.vllm_config,
             target_layer_names=target_attn_layer_names,
             additional_attn_cg_support=additional_attn_cg_support,
+            confidence_source=getattr(
+                self.speculator, "adaptive_confidence_source", "head"
+            ),
         )
 
         self.block_tables = BlockTables(
@@ -1850,6 +1853,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+        if self.adaptive_verification is not None:
+            if self.adaptive_verification.confidence_source == "history":
+                # History mode ingests per-row verify outcomes; the
+                # admitted widths this step are still live in the
+                # manager's capacity buffer.
+                self.adaptive_verification.record_acceptance(num_rejected, input_batch)
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -1942,7 +1951,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     mm_inputs=mm_inputs,
                 )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
-            if self.adaptive_verification is not None:
+            if (
+                self.adaptive_verification is not None
+                and self.adaptive_verification.confidence_source == "head"
+            ):
+                # Head mode only: the speculator publishes per-step
+                # confidence probs during drafting. History-mode
+                # drafters have no such attribute (and no drafting-side
+                # signal at all).
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
