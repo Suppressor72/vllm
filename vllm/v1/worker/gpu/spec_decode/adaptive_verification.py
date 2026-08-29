@@ -553,11 +553,13 @@ class AdaptiveVerificationManager:
             stale_confidences = self._history.conditionals(slots)
             # Mirror the conditionals into the GPU rank kernel's buffer
             # (head mode refreshes it per record_confidences; history
-            # mode refreshes it at budget time).
-            slots_t = torch.from_numpy(slots.astype(np.int64))
+            # mode refreshes it at budget time). Advanced indexing does
+            # not cross devices implicitly, so move both sides.
+            device = self._confidence_probs.device
+            slots_t = torch.from_numpy(slots.astype(np.int64)).to(device)
             self._confidence_probs[slots_t] = torch.from_numpy(
                 stale_confidences.astype(np.float32)
-            )
+            ).to(device)
         else:
             stale_confidences = self._stale_confidences[self._stale_idx].np[slots]
         survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
