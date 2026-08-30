@@ -259,3 +259,68 @@ def test_selector_calibration_matches_fitted_endpoints():
     assert y[0] == vals[0]
     assert y[3] == vals[-1]
     assert bool((y[1:3] >= vals[0]).all()) and bool((y[1:3] <= vals[-1]).all())
+
+
+# ------- Gate-1 defect regressions (each was a real bug) -------
+
+
+def test_seed_is_not_double_converted():
+    """The pooled seed must BE the conditional ladder, not a re-conversion.
+
+    The pre-fix bug: pool_num/pool_den already track per-position
+    conditionals, then _seed() passed them through
+    unconditional_to_conditional_rates, distorting the values (e.g.
+    true [0.9, 0.8] became ~[0.9, 0.889]).
+    """
+    est = AcceptanceHistoryEstimator(1, 2, alpha=1.0, min_count=1, warmup_steps=1)
+    # 10 steps at width 2: position 1 always verified; position 2 verified
+    # when pos-1 accepted. Feed known outcomes to produce a known pool.
+    for _ in range(10):
+        est.update(0, 2, 2)  # always fully accepted
+    # pool for pos 1: 10/10 = 1.0; pos 2: 10/10 = 1.0
+    seed = est._seed()
+    assert seed[0] == pytest.approx(1.0)
+    assert seed[1] == pytest.approx(1.0)
+
+    # Now with partial acceptance
+    est = AcceptanceHistoryEstimator(1, 2, alpha=1.0, min_count=1, warmup_steps=1)
+    for _ in range(10):
+        est.update(0, 2, 1)  # always accepted exactly 1 (pos 2 rejected)
+    # pool pos 1: 10 accepts / 10 verified = 1.0
+    # pool pos 2: 0 accepts / 10 verified-and-reached = 0.0
+    seed = est._seed()
+    assert seed[0] == pytest.approx(1.0)
+    assert seed[1] == pytest.approx(0.0)
+
+
+def test_seed_mixed_acceptance_no_double_conversion():
+    """With a 50% pool, the seed must be 0.5 — not 0.5/0.5 = 1.0."""
+    est = AcceptanceHistoryEstimator(1, 2, alpha=1.0, min_count=1, warmup_steps=1)
+    for i in range(20):
+        est.update(0, 2, 2 if i % 2 == 0 else 1)
+    seed = est._seed()
+    assert seed[0] == pytest.approx(1.0)  # always accept at pos 1
+    assert seed[1] == pytest.approx(0.5)  # half accept at pos 2
+
+
+def test_per_position_shrinkage():
+    """Sparsely observed tails must not inherit head confidence.
+
+    The pre-fix bug: shrinkage used the request's TOTAL step count for
+    every position, so a position observed once got the confidence of
+    a position observed 100 times.
+    """
+    est = AcceptanceHistoryEstimator(1, 4, alpha=0.3, min_count=8, warmup_steps=1)
+    # 100 steps at width 2, but only 2 steps at width 4
+    for _ in range(98):
+        est.update(0, 2, 2)
+    est.update(0, 4, 4)  # pos 4 observed (accepted 4)
+    est.update(0, 4, 3)  # pos 4 observed (reached 3, rejected at 4)
+    counts = est._pos_counts[0]
+    assert counts[0] >= 98  # pos 1: nearly every step
+    assert counts[3] == 2  # pos 4: only 2 observations
+    # The shrinkage confidence must differ
+    cond = est.conditionals(np.array([0]))[0]
+    # pos 1 should lean toward its own EMA (high confidence)
+    # pos 4 should lean toward the seed (low confidence from 2 obs)
+    assert cond[0] != cond[3]  # different shrinkage weights
