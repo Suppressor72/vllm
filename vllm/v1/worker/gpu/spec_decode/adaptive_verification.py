@@ -330,7 +330,10 @@ class AdaptiveVerificationManager:
         self.cost_tables: tuple[np.ndarray, np.ndarray] | None = None
         # Largest cudagraph-captured token count; above it nothing pads.
         self._cudagraph_limit = 0
-        self._batch_budget: tuple[dict[str, int], dict[str, int], int] | None = None
+        # (drafts/req, non-draft/req, budget, reserved/req)
+        self._batch_budget: (
+            tuple[dict[str, int], dict[str, int], int, dict[str, int]] | None
+        ) = None
         max_num_reqs = req_states.max_num_reqs
         # Current per-slot confidences
         self._confidence_probs = torch.empty(
@@ -490,12 +493,16 @@ class AdaptiveVerificationManager:
         chunked prefill are skipped — the sampling kernel zeroes their
         num_rejected, which would read as fake full-accepts.
         """
-        assert self._history is not None and self._hist_bufs is not None
+        assert self._history is not None
+        assert self._hist_bufs is not None
+        assert self._hist_events is not None
+        hist_bufs = self._hist_bufs
+        hist_events = self._hist_events
         num_reqs = input_batch.num_reqs
         ready_idx = self._hist_idx ^ 1
         with gpu_sync_allowed():
-            self._hist_events[ready_idx].synchronize()
-        landed = self._hist_bufs[ready_idx]
+            hist_events[ready_idx].synchronize()
+        landed = hist_bufs[ready_idx]
         if self._hist_pending_resets:
             for slot in self._hist_pending_resets:
                 self._history.reset(slot)
@@ -513,14 +520,14 @@ class AdaptiveVerificationManager:
         # Rotate: read the landed slot next time, write this step into
         # the slot nothing reads.
         self._hist_idx, write_idx = ready_idx, self._hist_idx
-        write_slot = self._hist_bufs[write_idx]
+        write_slot = hist_bufs[write_idx]
         write_slot.gpu[0, :num_reqs].copy_(num_rejected[:num_reqs])
         write_slot.gpu[1, :num_reqs].copy_(self._batch_draft_capacity[:num_reqs])
         current_stream = torch.cuda.current_stream(self.req_states.device)
         self._copy_stream.wait_stream(current_stream)
         with stream(self._copy_stream, current_stream):
             write_slot.copy_to_cpu()
-            self._hist_events[write_idx].record()
+            hist_events[write_idx].record()
 
     def get_num_tokens(
         self,
