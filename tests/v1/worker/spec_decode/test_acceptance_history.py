@@ -17,16 +17,16 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
+    AcceptanceHistoryEstimator,
+    _assign_draft_token_budget,
+    _min_width_reservation,
+)
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
     _SELECTOR_CAL_KNOTS,
     _SELECTOR_CAL_VALS,
     apply_selector_calibration,
     selector_acceptance_confidences,
-)
-from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
-    AcceptanceHistoryEstimator,
-    _assign_draft_token_budget,
-    _min_width_reservation,
 )
 
 RNG = np.random.default_rng(20260829)
