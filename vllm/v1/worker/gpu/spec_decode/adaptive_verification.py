@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Adaptive verification for DSpark speculative decoding."""
 
-import os
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING
@@ -116,114 +115,6 @@ def _min_width_reservation(
     return reserved
 
 
-def _history_env(name: str, default: str) -> str:
-    return os.environ.get(name, default)
-
-
-class AcceptanceHistoryEstimator:
-    """Censoring-aware per-request acceptance history (history mode).
-
-    Tracks, per request slot, a filtered EMA of ind(accepted >= p) over
-    steps that REACHED p-1 with position p actually verified — the
-    Kaplan-Meier-style predicate ``admitted >= p AND accepted >= p-1``.
-    A step that died before p-1, or whose death coincided with the trim
-    boundary, simply skips that position's update: unreached is not
-    rejected. Chunked-prefill rows are skipped entirely upstream (their
-    ``num_rejected`` is force-zeroed by the sampling kernel).
-
-    The stored values are CONDITIONAL per-position probabilities
-    q_p = P(accept_p | reached p-1): both budget consumers cumprod their
-    inputs into survival, so storing survival indicators would
-    double-compose. A pooled CONDITIONAL histogram (the pool counts are
-    already per-position conditionals — never converted a second time)
-    seeds cold requests; shrinkage is PER-POSITION (each position blends
-    toward the seed by its own observation count, so sparsely observed
-    tails stay seed-dominated). An empty pool seeds q=1.0
-    (full-width-biased, matching the per-request warmup pin). Delayed
-    D2H outcomes are mapped against the PRODUCING step's slot buffer,
-    so batch reorders between steps cannot misattribute observations.
-    """
-
-    def __init__(
-        self,
-        num_slots: int,
-        num_steps: int,
-        alpha: float,
-        min_count: int,
-        warmup_steps: int,
-    ) -> None:
-        self.num_steps = num_steps
-        self.alpha = alpha
-        self.min_count = min_count
-        self.warmup_steps = warmup_steps
-        self._ema = np.ones((num_slots, num_steps), dtype=np.float64)
-        self._steps = np.zeros(num_slots, dtype=np.int64)
-        # Per-(slot, position) counts: shrinkage weight per position.
-        self._pos_counts = np.zeros((num_slots, num_steps), dtype=np.int64)
-        # Pooled CONDITIONAL ladder: P(accept_p | reached p-1) over all
-        # request-steps where position p was verified and reached.
-        self._pool_num = np.zeros(num_steps, dtype=np.int64)
-        self._pool_den = np.zeros(num_steps, dtype=np.int64)
-
-    def reset(self, slot: int) -> None:
-        self._ema[slot].fill(1.0)
-        self._steps[slot] = 0
-        self._pos_counts[slot].fill(0)
-
-    def update(self, slot: int, admitted: int, accepted: int) -> None:
-        """Apply one (admitted, accepted) observation for a request.
-
-        `admitted` is the verify width that actually ran; `accepted`
-        the surviving prefix length (accepted <= admitted).
-        """
-        if admitted <= 0:
-            return
-        self._steps[slot] += 1
-        for p in range(1, self.num_steps + 1):
-            if admitted >= p and accepted >= p - 1:
-                survived = 1.0 if accepted >= p else 0.0
-                ema = self._ema[slot, p - 1]
-                self._ema[slot, p - 1] = (1.0 - self.alpha) * ema + self.alpha * (
-                    survived
-                )
-                self._pool_num[p - 1] += int(accepted >= p)
-                self._pool_den[p - 1] += 1
-                self._pos_counts[slot, p - 1] += 1
-
-    def _seed(self) -> np.ndarray:
-        """Pooled conditional ladder as the seed (q=1 if empty pool).
-
-        The pool counts are already per-position conditionals (updates
-        fire only when position p was verified AND reached p-1), so
-        they seed directly — no second conversion. Unobserved positions
-        seed optimistically (q=1): censored, not zero.
-        """
-        if (self._pool_den > 0).any():
-            return np.divide(
-                self._pool_num,
-                self._pool_den,
-                out=np.ones(self.num_steps, dtype=np.float64),
-                where=self._pool_den > 0,
-            ).clip(0.0, 1.0)
-        return np.ones(self.num_steps, dtype=np.float64)
-
-    def conditionals(self, slots: np.ndarray) -> np.ndarray:
-        """Shrunk conditional q_p for the given slots, shape (len(slots), K).
-
-        Shrinkage is per-position: each position blends toward the seed
-        by its own observation count, so a sparsely observed tail leans
-        on the pooled seed while a well-observed head trusts its EMA.
-        """
-        seed = self._seed()
-        counts = self._pos_counts[slots].astype(np.float64)
-        confidence = counts / (counts + self.min_count)
-        raw = self._ema[slots]
-        return (confidence * raw + (1.0 - confidence) * seed[None, :]).clip(0.0, 1.0)
-
-    def is_cold(self, slots: np.ndarray) -> np.ndarray:
-        return self._steps[slots] < self.warmup_steps
-
-
 def build_cost_tables_from_curves(
     draft_curve: list[tuple[int, float]],
     verify_curve: list[tuple[int, float]],
@@ -279,7 +170,6 @@ class AdaptiveVerificationManager:
         max_total_logits: int,
         min_draft_width: int = 0,
         min_width_max_reqs: int = 2,
-        confidence_source: str = "head",
     ):
         self.req_states = req_states
         self.num_speculative_steps = req_states.num_speculative_steps
@@ -292,40 +182,6 @@ class AdaptiveVerificationManager:
         self.min_draft_width = min_draft_width
         self.min_width_max_reqs = min_width_max_reqs
         self._floor_cap_warned = False
-        # "head": the speculator publishes per-step confidence probs
-        # (DSpark). "history": the manager derives censoring-aware
-        # per-request conditionals from observed acceptance (DFlash2,
-        # which has no confidence head).
-        self.confidence_source = confidence_source
-        self._history: AcceptanceHistoryEstimator | None = None
-        self._hist_bufs: list[CpuGpuBuffer] | None = None
-        self._hist_events: list[torch.cuda.Event] | None = None
-        self._hist_idx = 0
-        self._hist_pending_resets: list[int] = []
-        if confidence_source == "history":
-            self._history = AcceptanceHistoryEstimator(
-                req_states.max_num_reqs,
-                self.num_speculative_steps,
-                alpha=float(_history_env("VLLM_ADAPTIVE_HISTORY_ALPHA", "0.15")),
-                min_count=int(_history_env("VLLM_ADAPTIVE_HISTORY_MIN_COUNT", "8")),
-                warmup_steps=int(
-                    _history_env("VLLM_ADAPTIVE_HISTORY_WARMUP_STEPS", "8")
-                ),
-            )
-            # Dedicated int32 D2H slots: rows 0/1 = (num_rejected,
-            # admitted_width) per batch row; row 2 = the producing
-            # step's slot per row (delayed updates map by THIS, not the
-            # reader's mapping). Never packed into float32 matrices.
-            self._hist_bufs = [
-                CpuGpuBuffer(
-                    3,
-                    req_states.max_num_reqs,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                for _ in range(2)
-            ]
-            self._hist_events = [torch.cuda.Event(blocking=True) for _ in range(2)]
         # Rejection sampling verifies logits in one contiguous chunk; the
         # chunked path indexes by scheduled (untrimmed) offsets and cannot
         # address the compacted layout, so the budget must fit one chunk.
@@ -358,7 +214,11 @@ class AdaptiveVerificationManager:
         # FULL width instead, yielding uncensored per-slot observations.
         # Fixed seed: TP replicas execute the identical call sequence,
         # so both ranks draw the same audit steps and stay lockstep.
-        self._audit_pct = float(_history_env("VLLM_ADAPTIVE_AUDIT_FULL_WIDTH_PCT", "0"))
+        import os
+
+        self._audit_pct = float(
+            os.environ.get("VLLM_ADAPTIVE_AUDIT_FULL_WIDTH_PCT", "0")
+        )
         self._audit_rng = np.random.default_rng(0x5EED)
 
         # Two D2H slots preserve stale inputs for budget selection.
@@ -381,9 +241,6 @@ class AdaptiveVerificationManager:
         self._stale_confidences[self._stale_idx].np[req_idx].fill(1.0)
         self._pending_resets.append(req_idx)
         self._confidence_probs[req_idx].fill_(1.0)
-        if self._history is not None:
-            self._history.reset(req_idx)
-            self._hist_pending_resets.append(req_idx)
 
     def batches_to_profile(self, capture_sizes: list[int]) -> Iterator[dict[str, int]]:
         """Dummy-run kwargs whose step timings seed the cost tables.
@@ -481,62 +338,6 @@ class AdaptiveVerificationManager:
             write_slot.copy_to_cpu()
             self._copy_events[write_idx].record()
 
-    def record_acceptance(
-        self,
-        num_rejected: torch.Tensor,
-        input_batch: "InputBatch",
-    ) -> None:
-        """History mode: ingest this step's per-row verify outcomes.
-
-        `num_rejected` (device, batch-row order) pairs with the admitted
-        widths the allocator chose this step (`_batch_draft_capacity`,
-        still valid post-verify). One (num_rejected, admitted) int32 pair
-        per row goes to the CPU through the same double-buffer + event +
-        side-stream discipline as the head confidences; the landed
-        previous-step pair feeds the estimator below. Rows still in
-        chunked prefill are skipped — the sampling kernel zeroes their
-        num_rejected, which would read as fake full-accepts.
-        """
-        assert self._history is not None
-        assert self._hist_bufs is not None
-        assert self._hist_events is not None
-        hist_bufs = self._hist_bufs
-        hist_events = self._hist_events
-        num_reqs = input_batch.num_reqs
-        ready_idx = self._hist_idx ^ 1
-        with gpu_sync_allowed():
-            hist_events[ready_idx].synchronize()
-        landed = hist_bufs[ready_idx]
-        if self._hist_pending_resets:
-            for slot in self._hist_pending_resets:
-                self._history.reset(slot)
-            self._hist_pending_resets.clear()
-        # The landed slot holds the PREVIOUS step's outcomes AND that
-        # step's slot mapping (row 2, written at copy time): delayed
-        # updates map against the PRODUCING step's slots, so a batch
-        # reorder between steps cannot misattribute observations.
-        producer_slots = landed.np[2, :num_reqs]
-        rejected_np = landed.np[0, :num_reqs]
-        admitted_np = landed.np[1, :num_reqs]
-        for row in range(num_reqs):
-            slot = int(producer_slots[row])
-            admitted = int(admitted_np[row])
-            accepted = admitted - int(rejected_np[row])
-            self._history.update(slot, admitted, accepted)
-        # Rotate: read the landed slot next time, write this step into
-        # the slot nothing reads.
-        self._hist_idx, write_idx = ready_idx, self._hist_idx
-        write_slot = hist_bufs[write_idx]
-        write_slot.gpu[0, :num_reqs].copy_(num_rejected[:num_reqs])
-        write_slot.gpu[1, :num_reqs].copy_(self._batch_draft_capacity[:num_reqs])
-        # Buffer the producing step's slot mapping for the delayed read.
-        write_slot.gpu[2, :num_reqs].copy_(input_batch.idx_mapping[:num_reqs])
-        current_stream = torch.cuda.current_stream(self.req_states.device)
-        self._copy_stream.wait_stream(current_stream)
-        with stream(self._copy_stream, current_stream):
-            write_slot.copy_to_cpu()
-            hist_events[write_idx].record()
-
     def get_num_tokens(
         self,
         num_tokens_per_req: dict[str, int],
@@ -564,19 +365,7 @@ class AdaptiveVerificationManager:
             dtype=np.int32,
             count=len(req_ids),
         )
-        if self._history is not None:
-            stale_confidences = self._history.conditionals(slots)
-            # Mirror the conditionals into the GPU rank kernel's buffer
-            # (head mode refreshes it per record_confidences; history
-            # mode refreshes it at budget time). Advanced indexing does
-            # not cross devices implicitly, so move both sides.
-            device = self._confidence_probs.device
-            slots_t = torch.from_numpy(slots.astype(np.int64)).to(device)
-            self._confidence_probs[slots_t] = torch.from_numpy(
-                stale_confidences.astype(np.float32)
-            ).to(device)
-        else:
-            stale_confidences = self._stale_confidences[self._stale_idx].np[slots]
+        stale_confidences = self._stale_confidences[self._stale_idx].np[slots]
         survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
         steps = np.arange(self.num_speculative_steps)
         valid = steps[None, :] < scheduled_drafts[:, None]
@@ -626,14 +415,7 @@ class AdaptiveVerificationManager:
             self.min_width_max_reqs,
             max_draft_budget,
         )
-        if self._history is not None:
-            cold = self._history.is_cold(slots)
-            history_res = np.where(
-                cold, scheduled_drafts, (scheduled_drafts > 0).astype(np.int32)
-            )
-        else:
-            history_res = np.zeros_like(scheduled_drafts)
-        reserved = np.minimum(scheduled_drafts, np.maximum(floor_res, history_res))
+        reserved = floor_res
         reserved_total = int(reserved.sum())
         if (
             reserved_total > 0
@@ -807,7 +589,6 @@ def maybe_create_adaptive_verification_manager(
     vllm_config: "VllmConfig",
     target_layer_names: set[str] | None = None,
     additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,
-    confidence_source: str = "head",
 ) -> AdaptiveVerificationManager | None:
     if not enable_adaptive_verification:
         return None
@@ -860,5 +641,4 @@ def maybe_create_adaptive_verification_manager(
         max_total_logits=max_total_logits,
         min_draft_width=getattr(spec_config, "adaptive_min_draft_width", 0),
         min_width_max_reqs=getattr(spec_config, "adaptive_min_width_max_reqs", 2),
-        confidence_source=confidence_source,
     )

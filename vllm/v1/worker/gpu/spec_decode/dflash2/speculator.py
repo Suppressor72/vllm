@@ -196,12 +196,8 @@ class DFlash2Speculator(DFlashSpeculator):
         self.enable_adaptive_verification = (
             self.speculative_config.enable_adaptive_verification
         )
-        # Acceptance-estimate provider: selector by default (the
-        # stronger held-out signal in our measurements), history
-        # selectable via config.
-        self.adaptive_confidence_source = (
-            self.speculative_config.adaptive_confidence_source or "selector"
-        )
+        # Adaptive acceptance estimates come from the selector scores.
+        self.adaptive_confidence_source = "selector"
         if self.enable_adaptive_verification:
             self.draft_token_confidence_probs = torch.empty_like(
                 self.draft_tokens, dtype=torch.float32

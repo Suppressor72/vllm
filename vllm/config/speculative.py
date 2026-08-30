@@ -528,8 +528,7 @@ class SpeculativeConfig:
     enable_adaptive_verification: bool = False
     """Whether to adaptively size the draft-verification budget per request.
     Supported for method="dspark" (speculator confidence head) and for DFlash2
-    drafts (acceptance-estimate providers; the calibrated selector scores by
-    default, the observed-acceptance estimator via config)."""
+    drafts (calibrated selector scores)."""
 
     adaptive_min_draft_width: int = 0
     """Floor on the per-request verify budget, in draft tokens (0 = off).
@@ -545,14 +544,6 @@ class SpeculativeConfig:
     active only while the number of verifying requests in the batch is
     at most this value. Above it the cost-model argmax owns the
     decision (burst trimming stays possible)."""
-
-    adaptive_confidence_source: str | None = None
-    """Where adaptive verification draws its per-request acceptance
-    estimate from (the acceptance-probs provider). None = auto: the
-    DSpark confidence head for dspark drafts, the DFlash2 selector
-    softmax for DFlash2 drafts. Explicit: "head" (dspark only),
-    "history" (observed-acceptance estimator; DFlash2), "selector"
-    (calibrated DFlash2 selector scores)."""
 
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
@@ -639,7 +630,6 @@ class SpeculativeConfig:
         # output whenever it is active; hash it like the flag.
         factors.append(self.adaptive_min_draft_width)
         factors.append(self.adaptive_min_width_max_reqs)
-        factors.append(self.adaptive_confidence_source)
 
         if uses_aux_hidden_states and self.draft_model_config is not None:
             factors.append(self.draft_model_config.compute_hash())
@@ -1516,21 +1506,6 @@ class SpeculativeConfig:
                 raise ValueError(
                     "adaptive_min_width_max_reqs only applies together with "
                     "adaptive_min_draft_width > 0."
-                )
-            source = self.adaptive_confidence_source
-            if source not in (None, "head", "history", "selector"):
-                raise ValueError(
-                    "adaptive_confidence_source must be one of None, 'head', "
-                    f"'history', 'selector' (got {source!r})."
-                )
-            if source == "head" and self.method != "dspark":
-                raise ValueError(
-                    "adaptive_confidence_source='head' requires dspark "
-                    "(the confidence head lives in DSpark checkpoints)."
-                )
-            if source in ("history", "selector") and not has_dflash2_draft:
-                raise ValueError(
-                    f"adaptive_confidence_source={source!r} requires a DFlash2 draft."
                 )
 
         return self
