@@ -15,7 +15,6 @@ from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.v1.attention.backend import AttentionCGSupport
-from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu.async_utils import StepTimingSample, stream
 from vllm.v1.worker.gpu.attn_utils import (
@@ -135,13 +134,14 @@ class AcceptanceHistoryEstimator:
     The stored values are CONDITIONAL per-position probabilities
     q_p = P(accept_p | reached p-1): both budget consumers cumprod their
     inputs into survival, so storing survival indicators would
-    double-compose. A manager-local pooled unconditional histogram
-    (converted with the shared ``unconditional_to_conditional_rates``
-    helper) seeds cold requests, shrinking to the seed by observation
-    count; an empty pool seeds q=1.0 (full-width-biased, matching the
-    per-request warmup pin). The scalar-mean minimum-variance ladder is
-    deliberately NOT used as a seed: its exact zero tails are absorbing
-    under censoring.
+    double-compose. A pooled CONDITIONAL histogram (the pool counts are
+    already per-position conditionals — never converted a second time)
+    seeds cold requests; shrinkage is PER-POSITION (each position blends
+    toward the seed by its own observation count, so sparsely observed
+    tails stay seed-dominated). An empty pool seeds q=1.0
+    (full-width-biased, matching the per-request warmup pin). Delayed
+    D2H outcomes are mapped against the PRODUCING step's slot buffer,
+    so batch reorders between steps cannot misattribute observations.
     """
 
     def __init__(
@@ -158,14 +158,17 @@ class AcceptanceHistoryEstimator:
         self.warmup_steps = warmup_steps
         self._ema = np.ones((num_slots, num_steps), dtype=np.float64)
         self._steps = np.zeros(num_slots, dtype=np.int64)
-        # Pooled unconditional ladder: P(accepted >= p) over all
-        # request-steps where the KM predicate admitted the update.
+        # Per-(slot, position) counts: shrinkage weight per position.
+        self._pos_counts = np.zeros((num_slots, num_steps), dtype=np.int64)
+        # Pooled CONDITIONAL ladder: P(accept_p | reached p-1) over all
+        # request-steps where position p was verified and reached.
         self._pool_num = np.zeros(num_steps, dtype=np.int64)
         self._pool_den = np.zeros(num_steps, dtype=np.int64)
 
     def reset(self, slot: int) -> None:
         self._ema[slot].fill(1.0)
         self._steps[slot] = 0
+        self._pos_counts[slot].fill(0)
 
     def update(self, slot: int, admitted: int, accepted: int) -> None:
         """Apply one (admitted, accepted) observation for a request.
@@ -185,37 +188,37 @@ class AcceptanceHistoryEstimator:
                 )
                 self._pool_num[p - 1] += int(accepted >= p)
                 self._pool_den[p - 1] += 1
+                self._pos_counts[slot, p - 1] += 1
 
     def _seed(self) -> np.ndarray:
-        """Pooled unconditional ladder -> conditional seed (q=1 if empty)."""
+        """Pooled conditional ladder as the seed (q=1 if empty pool).
+
+        The pool counts are already per-position conditionals (updates
+        fire only when position p was verified AND reached p-1), so
+        they seed directly — no second conversion. Unobserved positions
+        seed optimistically (q=1): censored, not zero.
+        """
         if (self._pool_den > 0).any():
-            unconditional = np.divide(
+            return np.divide(
                 self._pool_num,
                 self._pool_den,
-                out=np.zeros(self.num_steps, dtype=np.float64),
+                out=np.ones(self.num_steps, dtype=np.float64),
                 where=self._pool_den > 0,
             ).clip(0.0, 1.0)
-            ladder = np.asarray(
-                unconditional_to_conditional_rates(unconditional.tolist()),
-                dtype=np.float64,
-            ).clip(0.0, 1.0)
-            # Only trust pooled positions with observations; a position
-            # is observed whenever any later position is. Unobserved
-            # positions seed optimistically (q=1): they are censored,
-            # not zero.
-            ladder[self._pool_den == 0] = 1.0
-            return ladder
         return np.ones(self.num_steps, dtype=np.float64)
 
     def conditionals(self, slots: np.ndarray) -> np.ndarray:
-        """Shrunk conditional q_p for the given slots, shape (len(slots), K)."""
+        """Shrunk conditional q_p for the given slots, shape (len(slots), K).
+
+        Shrinkage is per-position: each position blends toward the seed
+        by its own observation count, so a sparsely observed tail leans
+        on the pooled seed while a well-observed head trusts its EMA.
+        """
         seed = self._seed()
-        counts = self._steps[slots].astype(np.float64)
+        counts = self._pos_counts[slots].astype(np.float64)
         confidence = counts / (counts + self.min_count)
         raw = self._ema[slots]
-        return (
-            confidence[:, None] * raw + (1.0 - confidence)[:, None] * seed[None, :]
-        ).clip(0.0, 1.0)
+        return (confidence * raw + (1.0 - confidence) * seed[None, :]).clip(0.0, 1.0)
 
     def is_cold(self, slots: np.ndarray) -> np.ndarray:
         return self._steps[slots] < self.warmup_steps
@@ -310,11 +313,12 @@ class AdaptiveVerificationManager:
                 ),
             )
             # Dedicated int32 D2H slots: rows 0/1 = (num_rejected,
-            # admitted_width), both per batch row. Never packed into the
-            # float32 confidence matrices.
+            # admitted_width) per batch row; row 2 = the producing
+            # step's slot per row (delayed updates map by THIS, not the
+            # reader's mapping). Never packed into float32 matrices.
             self._hist_bufs = [
                 CpuGpuBuffer(
-                    2,
+                    3,
                     req_states.max_num_reqs,
                     dtype=torch.int32,
                     device=device,
@@ -507,13 +511,15 @@ class AdaptiveVerificationManager:
             for slot in self._hist_pending_resets:
                 self._history.reset(slot)
             self._hist_pending_resets.clear()
-        # The landed slot holds the PREVIOUS step's outcomes (one step
-        # stale, mirroring head mode): apply the censored updates now.
-        slots_np = input_batch.idx_mapping.cpu().numpy()
+        # The landed slot holds the PREVIOUS step's outcomes AND that
+        # step's slot mapping (row 2, written at copy time): delayed
+        # updates map against the PRODUCING step's slots, so a batch
+        # reorder between steps cannot misattribute observations.
+        producer_slots = landed.np[2, :num_reqs]
         rejected_np = landed.np[0, :num_reqs]
         admitted_np = landed.np[1, :num_reqs]
         for row in range(num_reqs):
-            slot = int(slots_np[row])
+            slot = int(producer_slots[row])
             admitted = int(admitted_np[row])
             accepted = admitted - int(rejected_np[row])
             self._history.update(slot, admitted, accepted)
@@ -523,6 +529,8 @@ class AdaptiveVerificationManager:
         write_slot = hist_bufs[write_idx]
         write_slot.gpu[0, :num_reqs].copy_(num_rejected[:num_reqs])
         write_slot.gpu[1, :num_reqs].copy_(self._batch_draft_capacity[:num_reqs])
+        # Buffer the producing step's slot mapping for the delayed read.
+        write_slot.gpu[2, :num_reqs].copy_(input_batch.idx_mapping[:num_reqs])
         current_stream = torch.cuda.current_stream(self.req_states.device)
         self._copy_stream.wait_stream(current_stream)
         with stream(self._copy_stream, current_stream):
