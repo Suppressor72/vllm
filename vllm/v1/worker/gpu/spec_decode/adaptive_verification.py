@@ -661,7 +661,7 @@ class AdaptiveVerificationManager:
         ):
             forced = min(scheduled_total, max_draft_budget)
             logger.info(
-                "ADFLASH-AUDIT-FULL-WIDTH reqs=%d policy_budget=%d forced=%d",
+                "ADAPTIVE-AUDIT-FULL-WIDTH reqs=%d policy_budget=%d forced=%d",
                 num_reqs,
                 draft_budget,
                 forced,

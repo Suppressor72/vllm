@@ -20,8 +20,8 @@ logger = init_logger(__name__)
 # on raw centers (empty bins retained as plateaus), monotone via
 # cumulative max (a weighted-PAVA refit scores within 0.002 AUC / 0.001
 # Brier). Fit on the adaptive-dflash P2.2a-reliable training split
-# (2026-08-29, logs/p2_obs2, n=4478; operational held-out Brier 0.133 /
-# AUC 0.862). Input feature: softmax top-1 over the realized top-k
+# (4,478 in-serving observations of realized selector scores and
+# per-position acceptance; held-out Brier 0.133 / AUC 0.862). Input feature: softmax top-1 over the realized top-k
 # selector scores = the BEST candidate's confidence (under greedy
 # sampling the selected path token; under temperature the walk may
 # differ — self-consistent with the calibration data, but estimates
