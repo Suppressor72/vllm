@@ -1853,12 +1853,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
-        if self.adaptive_verification is not None:
-            if self.adaptive_verification.confidence_source == "history":
-                # History mode ingests per-row verify outcomes; the
-                # admitted widths this step are still live in the
-                # manager's capacity buffer.
-                self.adaptive_verification.record_acceptance(num_rejected, input_batch)
+        if (
+            self.adaptive_verification is not None
+            and self.adaptive_verification.confidence_source == "history"
+        ):
+            # History mode ingests per-row verify outcomes; the admitted
+            # widths this step are still live in the capacity buffer.
+            self.adaptive_verification.record_acceptance(num_rejected, input_batch)
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).

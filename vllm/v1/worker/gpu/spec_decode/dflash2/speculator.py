@@ -7,12 +7,11 @@ from typing import Any
 import torch
 
 from vllm.config import VllmConfig
-from vllm.logger import init_logger
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
-
 
 logger = init_logger(__name__)
 
@@ -21,7 +20,8 @@ logger = init_logger(__name__)
 # cumulative max (a weighted-PAVA refit scores within 0.002 AUC / 0.001
 # Brier). Fit on the adaptive-dflash P2.2a-reliable training split
 # (4,478 in-serving observations of realized selector scores and
-# per-position acceptance; held-out Brier 0.133 / AUC 0.862). Input feature: softmax top-1 over the realized top-k
+# per-position acceptance; held-out Brier 0.133 / AUC 0.862). Input feature:
+# softmax top-1 over the realized top-k
 # selector scores = the BEST candidate's confidence (under greedy
 # sampling the selected path token; under temperature the walk may
 # differ — self-consistent with the calibration data, but estimates
