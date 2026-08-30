@@ -528,7 +528,8 @@ class SpeculativeConfig:
     enable_adaptive_verification: bool = False
     """Whether to adaptively size the draft-verification budget per request.
     Supported for method="dspark" (speculator confidence head) and for DFlash2
-    drafts (observed-acceptance history; DFlash2 checkpoints have no head)."""
+    drafts (acceptance-estimate providers; the calibrated selector scores by
+    default, the observed-acceptance estimator via config)."""
 
     adaptive_min_draft_width: int = 0
     """Floor on the per-request verify budget, in draft tokens (0 = off).

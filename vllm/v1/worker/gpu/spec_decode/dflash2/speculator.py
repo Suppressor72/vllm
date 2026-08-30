@@ -18,7 +18,7 @@ logger = init_logger(__name__)
 # Calibrated acceptance map for the selector provider: 20 quantile bins
 # on raw centers (empty bins retained as plateaus), monotone via
 # cumulative max (a weighted-PAVA refit scores within 0.002 AUC / 0.001
-# Brier). Fit on the adaptive-dflash P2.2a-reliable training split
+# Brier). Fit on an in-serving training split
 # (4,478 in-serving observations of realized selector scores and
 # per-position acceptance; held-out Brier 0.133 / AUC 0.862). Input feature:
 # softmax top-1 over the realized top-k
@@ -196,8 +196,9 @@ class DFlash2Speculator(DFlashSpeculator):
         self.enable_adaptive_verification = (
             self.speculative_config.enable_adaptive_verification
         )
-        # Acceptance-estimate provider: selector by default (the P2.2
-        # held-out winner), history selectable via config.
+        # Acceptance-estimate provider: selector by default (the
+        # stronger held-out signal in our measurements), history
+        # selectable via config.
         self.adaptive_confidence_source = (
             self.speculative_config.adaptive_confidence_source or "selector"
         )
