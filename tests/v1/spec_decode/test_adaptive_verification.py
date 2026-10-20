@@ -10,6 +10,7 @@ import pytest
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
 from vllm.v1.worker.gpu.async_utils import StepTimingSample
+from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
 from vllm.v1.worker.gpu.spec_decode import adaptive_verification as adaptive_module
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
@@ -109,9 +110,6 @@ def test_manager_scopes_varlen_check_without_weakening_runner_cg_mode(
             group("draft", draft_builder),
         ]
     ]
-    runner_support = AttentionCGSupportInfo(
-        AttentionCGSupport.UNIFORM_BATCH, "DraftBackend"
-    )
     created = object()
     monkeypatch.setattr(
         adaptive_module,
@@ -122,8 +120,7 @@ def test_manager_scopes_varlen_check_without_weakening_runner_cg_mode(
     manager = maybe_create_adaptive_verification_manager(
         enable_adaptive_verification=True,
         attn_groups=groups,
-        attn_cg_support=runner_support,
-        req_states=object(),
+        req_states=SimpleNamespace(num_speculative_steps=7),
         query_start_loc=object(),
         num_bonus_tokens=1,
         max_total_logits=1,
@@ -132,7 +129,6 @@ def test_manager_scopes_varlen_check_without_weakening_runner_cg_mode(
     )
 
     assert manager is created
-    assert runner_support.min_cg_support == AttentionCGSupport.UNIFORM_BATCH
 
 
 @pytest.mark.parametrize(
@@ -248,7 +244,8 @@ def test_manager_rejects_backend_without_varlen_decode_cudagraphs():
             return True
 
     builder = SimpleNamespace(
-        get_cudagraph_support=lambda *_args: AttentionCGSupport.UNIFORM_BATCH
+        get_cudagraph_support=lambda *_args: AttentionCGSupport.UNIFORM_BATCH,
+        get_varlen_cudagraph_max_query_len=lambda *_args: None,
     )
     group = SimpleNamespace(
         layer_names=["target"],
@@ -256,14 +253,12 @@ def test_manager_rejects_backend_without_varlen_decode_cudagraphs():
         kv_cache_spec=None,
         get_metadata_builder=lambda _index: builder,
     )
-    support = AttentionCGSupportInfo(AttentionCGSupport.UNIFORM_BATCH, "TargetBackend")
 
     with pytest.raises(ValueError, match="allows none"):
         maybe_create_adaptive_verification_manager(
             enable_adaptive_verification=True,
             attn_groups=[[group]],
-            attn_cg_support=support,
-            req_states=object(),
+            req_states=SimpleNamespace(num_speculative_steps=7),
             query_start_loc=object(),
             num_bonus_tokens=1,
             max_total_logits=1,
