@@ -461,13 +461,12 @@ def test_zero_budget_keeps_one_grammar_row_per_scheduled_draft():
 
 
 def test_manager_gate_accepts_varlen_decode_support(monkeypatch):
-    """VARLEN_DECODE (GDN) satisfies the varlen-decode cudagraph
-    requirement without claiming mixed prefill-decode full capture."""
+    """UNIFORM_BATCH + a varlen bound (GDN) satisfies the varlen-decode
+    cudagraph requirement without claiming mixed prefill-decode full capture."""
     import torch
 
     from vllm.v1.attention.backend import AttentionCGSupport
     from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend
-    from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
     from vllm.v1.worker.gpu.spec_decode import adaptive_verification as av
 
     sentinel = object()
@@ -475,18 +474,16 @@ def test_manager_gate_accepts_varlen_decode_support(monkeypatch):
         av, "AdaptiveVerificationManager", lambda *args, **kwargs: sentinel
     )
     groups = [[SimpleNamespace(backend=GDNAttentionBackend)]]
-    for support in (AttentionCGSupport.VARLEN_DECODE, AttentionCGSupport.ALWAYS):
-        manager = av.maybe_create_adaptive_verification_manager(
-            enable_adaptive_verification=True,
-            attn_groups=groups,
-            vllm_config=None,
-            attn_cg_support=AttentionCGSupportInfo(support, "GDN_ATTN"),
-            req_states=object(),
-            query_start_loc=torch.zeros(4, dtype=torch.int32),
-            num_bonus_tokens=1,
-            max_total_logits=1024,
-        )
-        assert manager is sentinel
+    manager = av.maybe_create_adaptive_verification_manager(
+        enable_adaptive_verification=True,
+        attn_groups=groups,
+        vllm_config=None,
+        req_states=SimpleNamespace(num_speculative_steps=7),
+        query_start_loc=torch.zeros(4, dtype=torch.int32),
+        num_bonus_tokens=1,
+        max_total_logits=1024,
+    )
+    assert manager is sentinel
 
 
 def test_manager_gate_rejects_below_varlen_decode_support(monkeypatch):
@@ -495,27 +492,20 @@ def test_manager_gate_rejects_below_varlen_decode_support(monkeypatch):
 
     from vllm.v1.attention.backend import AttentionCGSupport
     from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend
-    from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
     from vllm.v1.worker.gpu.spec_decode import adaptive_verification as av
 
     monkeypatch.setattr(av, "AdaptiveVerificationManager", lambda *args, **kwargs: None)
     groups = [[SimpleNamespace(backend=GDNAttentionBackend)]]
-    for support in (
-        AttentionCGSupport.UNIFORM_BATCH,
-        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE,
-        AttentionCGSupport.NEVER,
-    ):
-        with pytest.raises(ValueError, match="VARLEN_DECODE"):
-            av.maybe_create_adaptive_verification_manager(
-                enable_adaptive_verification=True,
-                attn_groups=groups,
-                vllm_config=None,
-            attn_cg_support=AttentionCGSupportInfo(support, "GDN_ATTN"),
-                req_states=object(),
-                query_start_loc=torch.zeros(4, dtype=torch.int32),
-                num_bonus_tokens=1,
-                max_total_logits=1024,
-            )
+    with pytest.raises(ValueError, match="allows none"):
+        av.maybe_create_adaptive_verification_manager(
+            enable_adaptive_verification=True,
+            attn_groups=groups,
+            vllm_config=None,
+            req_states=SimpleNamespace(num_speculative_steps=7),
+            query_start_loc=torch.zeros(4, dtype=torch.int32),
+            num_bonus_tokens=1,
+            max_total_logits=1024,
+        )
 
 
 def test_manager_gate_rejects_query_lens_mismatch_unsupported_backend(monkeypatch):
