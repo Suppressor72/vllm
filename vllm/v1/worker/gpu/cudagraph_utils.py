@@ -138,7 +138,6 @@ def _is_compatible(
     )
 
 
-<<<<<<< HEAD
 def has_compiled_submodule(model: nn.Module) -> bool:
     """Whether any submodule is an active @support_torch_compile module."""
     return any(
@@ -148,8 +147,6 @@ def has_compiled_submodule(model: nn.Module) -> bool:
     )
 
 
-=======
->>>>>>> 7207bfbad5 (fix: honest varlen capture geometry + cache hash for adaptive DSpark verification)
 def varlen_descriptor_rungs(
     num_tokens: int, max_query_len: int, max_num_reqs: int
 ) -> list[tuple[int, int]]:
