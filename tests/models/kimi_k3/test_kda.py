@@ -728,7 +728,7 @@ def test_kda_spec_decode_ragged_matches_per_request():
     )
 
     ragged_state = initial_state.clone()
-    ragged_output, _ = fused_recurrent_kda(
+    ragged_output, _ = SPEC_DECODE_IMPLS[DEVICE](
         q=q,
         k=k,
         v=v,
@@ -748,7 +748,7 @@ def test_kda_spec_decode_ragged_matches_per_request():
     for request_idx, (start, end) in enumerate(
         zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist())
     ):
-        request_output, _ = fused_recurrent_kda(
+        request_output, _ = SPEC_DECODE_IMPLS[DEVICE](
             q=q[:, start:end],
             k=k[:, start:end],
             v=v[:, start:end],

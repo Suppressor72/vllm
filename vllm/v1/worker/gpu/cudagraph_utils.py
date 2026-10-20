@@ -330,18 +330,26 @@ class CudaGraphManager:
                     self.decode_query_len,
                     max(decode_query_lens, default=self.decode_query_len),
                 )
-                for _r, _maxq_rung in varlen_descriptor_rungs(
-                    num_tokens, _maxq, self.max_num_reqs
-                ):
-                    desc = BatchExecutionDescriptor(
-                        cg_mode=decode_mode,
-                        num_tokens=num_tokens,
-                        num_reqs=_r,
-                        max_query_len=_maxq_rung,
-                        num_active_loras=num_active_loras,
-                    )
-                    if desc not in descs_by_mode[decode_mode]:
-                        descs_by_mode[decode_mode].append(desc)
+                # Skip capture sizes infeasible under the effective query bound:
+                # no distribution of num_tokens over <=max_num_reqs requests can
+                # stay within _maxq tokens per request.
+                if num_tokens <= _maxq * self.max_num_reqs:
+                    for _r, _maxq_rung in varlen_descriptor_rungs(
+                        num_tokens, _maxq, self.max_num_reqs
+                    ):
+                        # Filter infeasible rungs: the rung must be able to hold
+                        # num_tokens within its per-request cap and request count.
+                        if _r > self.max_num_reqs or _r * _maxq_rung < num_tokens:
+                            continue
+                        desc = BatchExecutionDescriptor(
+                            cg_mode=decode_mode,
+                            num_tokens=num_tokens,
+                            num_reqs=_r,
+                            max_query_len=_maxq_rung,
+                            num_active_loras=num_active_loras,
+                        )
+                        if desc not in descs_by_mode[decode_mode]:
+                            descs_by_mode[decode_mode].append(desc)
             # Capture uniform decode specfifc graphs if required
             #  (i.e. separate decode routine)
             elif separate_decode_routine and decode_mode and not self.varlen_decode:

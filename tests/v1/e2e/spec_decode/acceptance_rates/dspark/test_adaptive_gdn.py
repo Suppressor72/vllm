@@ -41,7 +41,7 @@ class _BatchObservation(TypedDict):
 class _DispatchObservation(_BatchObservation):
     uniform_token_count: int | None
     cg_mode: CUDAGraphMode
-    decode_only: bool
+    max_query_len: int | None
 
 
 pytestmark = [
@@ -85,7 +85,7 @@ def test_adaptive_dspark_replays_ragged_gdn_decode(
         uniform_token_count: int | None,
         num_active_loras: int,
         max_query_len: int | None = None,
-        has_prefill: bool = False,
+        num_ubatches: int = 1,
     ):
         desc = original_dispatch(
             manager,
@@ -94,11 +94,11 @@ def test_adaptive_dspark_replays_ragged_gdn_decode(
             uniform_token_count,
             num_active_loras,
             max_query_len=max_query_len,
-            has_prefill=has_prefill,
+            num_ubatches=num_ubatches,
         )
         if manager.varlen_decode:
             observed_dispatches.append(
-                (uniform_token_count, has_prefill, desc.cg_mode, desc.decode_only)
+                (uniform_token_count, max_query_len, desc.cg_mode, desc.max_query_len)
             )
         return desc
 
@@ -279,19 +279,19 @@ def test_adaptive_dspark_replays_ragged_gdn_decode(
         )
         assert any(
             uniform_token_count is None
-            and not has_prefill
+            and input_max_query_len is not None
             and cg_mode == CUDAGraphMode.FULL
-            and decode_only
+            and desc_max_query_len is not None
             for (
                 uniform_token_count,
-                has_prefill,
+                input_max_query_len,
                 cg_mode,
-                decode_only,
+                desc_max_query_len,
             ) in observed_dispatches
         ), "ragged decode never used a decode-only FULL graph"
         assert not any(
-            has_prefill and decode_only
-            for _, has_prefill, _, decode_only in observed_dispatches
+            input_max_query_len is None and desc_max_query_len is not None
+            for _, input_max_query_len, _, desc_max_query_len in observed_dispatches
         ), "a prefill batch used a decode-only FULL graph"
         for cpu_query_lens, device_query_lens, draft_budget in ragged_layouts:
             expected_total = len(device_query_lens) + draft_budget
@@ -362,7 +362,7 @@ def test_adaptive_dspark_mixed_prefill_uses_piecewise(
         uniform_token_count: int | None,
         num_active_loras: int,
         max_query_len: int | None = None,
-        has_prefill: bool = False,
+        num_ubatches: int = 1,
     ):
         descriptor = original_dispatch(
             manager,
@@ -371,7 +371,7 @@ def test_adaptive_dspark_mixed_prefill_uses_piecewise(
             uniform_token_count,
             num_active_loras,
             max_query_len=max_query_len,
-            has_prefill=has_prefill,
+            num_ubatches=num_ubatches,
         )
         if manager.varlen_decode and current_batch is not None:
             observed_dispatches.append(
@@ -379,7 +379,7 @@ def test_adaptive_dspark_mixed_prefill_uses_piecewise(
                     **current_batch,
                     uniform_token_count=uniform_token_count,
                     cg_mode=descriptor.cg_mode,
-                    decode_only=descriptor.decode_only,
+                    max_query_len=descriptor.max_query_len,
                 )
             )
         return descriptor
@@ -470,7 +470,8 @@ def test_adaptive_dspark_mixed_prefill_uses_piecewise(
         "the late request was never scheduled with an adaptive decode request"
     )
     assert all(
-        dispatch["cg_mode"] == CUDAGraphMode.PIECEWISE and not dispatch["decode_only"]
+        dispatch["cg_mode"] == CUDAGraphMode.PIECEWISE
+        and dispatch["max_query_len"] is None
         for dispatch in mixed_dispatches
     ), mixed_dispatches
 
