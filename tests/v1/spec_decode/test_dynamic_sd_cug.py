@@ -249,26 +249,24 @@ def test_varlen_decode_full_graph_rejects_mixed_prefill(monkeypatch):
     manager._graphs_captured = True
 
     ragged_decode = manager.dispatch(
-        num_reqs=3,
+        num_reqs=6,
         num_tokens=6,
         uniform_token_count=None,
         num_active_loras=0,
-        max_query_len=4,
-        has_prefill=False,
+        max_query_len=1,
     )
     assert ragged_decode.cg_mode == CUDAGraphMode.FULL
-    assert ragged_decode.decode_only
+    assert ragged_decode.max_query_len is not None
 
     mixed_batch = manager.dispatch(
-        num_reqs=3,
+        num_reqs=6,
         num_tokens=6,
         uniform_token_count=None,
         num_active_loras=0,
-        max_query_len=4,
-        has_prefill=True,
+        max_query_len=None,
     )
     assert mixed_batch.cg_mode == CUDAGraphMode.PIECEWISE
-    assert not mixed_batch.decode_only
+    assert mixed_batch.max_query_len is None
 
 
 def test_has_prefill_does_not_disable_mixed_full_graph(monkeypatch):
@@ -297,11 +295,10 @@ def test_has_prefill_does_not_disable_mixed_full_graph(monkeypatch):
         num_tokens=6,
         uniform_token_count=None,
         num_active_loras=0,
-        max_query_len=4,
-        has_prefill=True,
+        max_query_len=None,
     )
     assert desc.cg_mode == CUDAGraphMode.FULL
-    assert not desc.decode_only
+    assert desc.max_query_len is None
 
 
 def test_dp_sync_keeps_prefill_rank_out_of_varlen_decode_graph(monkeypatch):
@@ -311,21 +308,19 @@ def test_dp_sync_keeps_prefill_rank_out_of_varlen_decode_graph(monkeypatch):
         "get_pp_group",
         lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
     )
-    monkeypatch.setattr(
-        dp_utils,
-        "get_dp_group",
-        lambda: SimpleNamespace(cpu_group=object()),
-    )
-
-    def fake_all_reduce(tensor, group):
-        assert group is not None
+    def fake_cpu_all_reduce_(tensor):
         tensor[0, 1] = 6
         tensor[1, 1] = CUDAGraphMode.PIECEWISE.value
         tensor[2, 1] = 0
-        tensor[3, 1] = 4
-        tensor[4, 1] = 1
+        tensor[3, 1] = -1  # prefill rank: max_query_len = -1
+        tensor[4, 1] = 0
+        tensor[5, 1] = 3
 
-    monkeypatch.setattr(dp_utils.dist, "all_reduce", fake_all_reduce)
+    monkeypatch.setattr(
+        dp_utils,
+        "get_dp_group",
+        lambda: SimpleNamespace(cpu_all_reduce_=fake_cpu_all_reduce_),
+    )
     vllm_config = _create_vllm_config_for_dsd(
         max_num_seqs=8,
         max_spec_tokens=7,
@@ -340,11 +335,11 @@ def test_dp_sync_keeps_prefill_rank_out_of_varlen_decode_graph(monkeypatch):
     )
     manager._graphs_captured = True
     local_desc = manager.dispatch(
-        num_reqs=3,
+        num_reqs=6,
         num_tokens=6,
         uniform_token_count=None,
         num_active_loras=0,
-        max_query_len=4,
+        max_query_len=1,
     )
     assert local_desc.cg_mode == CUDAGraphMode.FULL
 
@@ -352,12 +347,11 @@ def test_dp_sync_keeps_prefill_rank_out_of_varlen_decode_graph(monkeypatch):
         manager,
         local_desc,
         num_tokens=6,
-        num_reqs=3,
+        num_reqs=6,
         uniform_token_count=None,
         dp_size=2,
         dp_rank=0,
-        max_query_len=4,
-        has_prefill=False,
+        max_query_len=1,
     )
     assert synced_desc.cg_mode == CUDAGraphMode.PIECEWISE
 
