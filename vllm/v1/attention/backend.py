@@ -554,7 +554,7 @@ M = TypeVar("M")
 class AttentionCGSupport(Enum):
     """Constants for the cudagraph support of the attention backend"""
 
-    ALWAYS = 4
+    ALWAYS = 3
     """Cudagraph always supported; supports mixed-prefill-decode"""
     UNIFORM_BATCH = 2
     """Cudagraph supported for batches the only contain query lengths that are

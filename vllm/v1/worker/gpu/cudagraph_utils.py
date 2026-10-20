@@ -339,7 +339,6 @@ class CudaGraphManager:
                         num_reqs=_r,
                         max_query_len=_maxq_rung,
                         num_active_loras=num_active_loras,
-                        decode_only=True,
                     )
                     if desc not in descs_by_mode[decode_mode]:
                         descs_by_mode[decode_mode].append(desc)
@@ -363,7 +362,6 @@ class CudaGraphManager:
                         num_reqs=rounded_num_reqs,
                         uniform_token_count=decode_query_len,
                         num_active_loras=num_active_loras,
-                        decode_only=True,
                     )
 
                     # avoid duplicate graphs
