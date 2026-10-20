@@ -679,7 +679,8 @@ def test_kda_spec_decode_correctness(
 
 
 @torch.inference_mode()
-def test_kda_spec_decode_ragged_matches_per_request():
+@pytest.mark.parametrize("impl", SPEC_DECODE_IMPLS.keys())
+def test_kda_spec_decode_ragged_matches_per_request(impl: str):
     """The KDA path inheriting GDN varlen support must consume device cu_seqlens."""
     query_lens = [4, 2, 1]
     num_seqs, max_query_len, H, D = len(query_lens), max(query_lens), 12, 128
@@ -728,7 +729,7 @@ def test_kda_spec_decode_ragged_matches_per_request():
     )
 
     ragged_state = initial_state.clone()
-    ragged_output, _ = SPEC_DECODE_IMPLS[DEVICE](
+    ragged_output, _ = SPEC_DECODE_IMPLS[impl](
         q=q,
         k=k,
         v=v,
@@ -748,7 +749,7 @@ def test_kda_spec_decode_ragged_matches_per_request():
     for request_idx, (start, end) in enumerate(
         zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist())
     ):
-        request_output, _ = SPEC_DECODE_IMPLS[DEVICE](
+        request_output, _ = SPEC_DECODE_IMPLS[impl](
             q=q[:, start:end],
             k=k[:, start:end],
             v=v[:, start:end],
